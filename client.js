@@ -68,16 +68,13 @@ export default function render(shadow, ctx) {
   const showCaption = data.show_caption !== false && opts.show_caption !== false;
   const caption = showCaption ? captionFor(data) : "";
 
+  // ``object-fit`` lives on the inline ``style`` attribute on
+  // ``<img>`` so it outranks ``spectra-widgets.css`` ``.w.is-bleed
+  // > img``, which otherwise hardcodes ``cover`` and ignores the
+  // cell's scale option.
   shadow.innerHTML = `
     ${css}
     <style>
-      .pi-img {
-        width: 100%;
-        height: 100%;
-        display: block;
-        object-fit: ${fit};
-        object-position: center;
-      }
       .pi-caption {
         position: absolute;
         left: 0;
@@ -93,7 +90,8 @@ export default function render(shadow, ctx) {
       }
     </style>
     <div class="w is-bleed" data-widget="picture_immich">
-      <img class="pi-img" src="${escapeHtml(data.image_url)}" alt="" loading="eager">
+      <img src="${escapeHtml(data.image_url)}" alt="" loading="eager"
+           style="width:100%;height:100%;display:block;object-fit:${fit};object-position:center;">
       ${caption ? `<div class="pi-caption">${escapeHtml(caption)}</div>` : ""}
     </div>`;
 }
