@@ -1,0 +1,90 @@
+{% extends "_base.html" %}
+{% from "_components.html" import card_head, button %}
+{% block title %}{% if mode == 'new' %}New Immich library{% else %}{{ library.name }}, Tesserae{% endif %}{% endblock %}
+
+{% block main %}
+<div class="page-head">
+  <h1><i class="ph-bold ph-images-square" aria-hidden="true"></i> {% if mode == 'new' %}New Immich library{% else %}{{ library.name }}{% endif %}</h1>
+  <p class="page-blurb"><a href="{{ url_for('picture_immich_admin.index') }}"><i class="ph ph-arrow-left" aria-hidden="true"></i> Back to libraries</a></p>
+</div>
+
+{% if test_result is not none %}
+<section class="card pi-test {% if test_result.ok %}pi-test-ok{% else %}pi-test-fail{% endif %}">
+  {% if test_result.ok %}
+  <p><i class="ph-bold ph-check-circle" aria-hidden="true"></i><span>{{ test_result.message }}</span></p>
+  {% else %}
+  <p><i class="ph-bold ph-x-circle" aria-hidden="true"></i><span>{{ test_result.message }}</span></p>
+  <p class="pi-test-hint">Check the URL + port from a browser tab. Immich's default port is <code>2283</code>; if you've moved it, make sure the URL above matches. The API key must come from <em>Account Settings &rarr; API Keys</em> on your Immich profile.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="card">
+  {{ card_head('Connection', icon_name='plugs-connected', level=2,
+               blurb='URL, API key, and a friendly name. The API key is stored encrypted on disk; the panel client never sees it.') }}
+
+  {% set form_action = url_for('picture_immich_admin.create_library') if mode == 'new' else url_for('picture_immich_admin.update_library', library_id=library.id) %}
+  <form method="post" action="{{ form_action }}" class="form" autocomplete="off">
+    <div class="field-grid">
+      <div class="field">
+        <label for="immich-name">Name</label>
+        <input type="text" id="immich-name" name="name" required maxlength="64"
+               value="{{ library.name if library else '' }}"
+               placeholder="Home Immich" autofocus>
+        <p class="field-help">Shows up in the cell editor's Library dropdown.</p>
+      </div>
+
+      <div class="field">
+        <label for="immich-url">URL</label>
+        <input type="url" id="immich-url" name="url" required
+               value="{{ library.url if library else '' }}"
+               placeholder="http://immich.home.lan:2283">
+        <p class="field-help">No trailing slash. Tesserae appends <code>/api/...</code> itself. Default Immich port is <code>2283</code>.</p>
+      </div>
+
+      <div class="field">
+        <label for="immich-key">API key</label>
+        <input type="password" id="immich-key" name="api_key"
+               {% if mode == 'new' %}required{% endif %}
+               placeholder="{{ '••••••••••••••••' if library and library.has_key else 'Paste a long-lived API key' }}"
+               autocomplete="new-password">
+        <p class="field-help">
+          Generate one under your Immich profile, <em>Account Settings &rarr; API Keys</em>.
+          {% if mode == 'edit' %}Leave blank to keep the existing key.{% endif %}
+        </p>
+      </div>
+    </div>
+
+    <div class="actions">
+      {{ button(('Add library' if mode == 'new' else 'Save'), icon='floppy-disk') }}
+      {% if mode == 'edit' %}
+      <button type="submit" formaction="{{ url_for('picture_immich_admin.test_library', library_id=library.id) }}" class="btn">
+        <i class="ph ph-broadcast" aria-hidden="true"></i>
+        <span>Test connection</span>
+      </button>
+      <form method="post" action="{{ url_for('picture_immich_admin.delete_library', library_id=library.id) }}"
+            onsubmit="return confirm('Remove this library? Cells using it will fall back to an error state until reassigned.');"
+            style="display:inline;">
+        <button type="submit" class="btn btn-ghost">
+          <i class="ph ph-trash" aria-hidden="true"></i>
+          <span>Delete</span>
+        </button>
+      </form>
+      {% endif %}
+    </div>
+  </form>
+</section>
+
+<style>
+  .pi-test { padding: 14px 18px; }
+  .pi-test p { display: flex; align-items: flex-start; gap: 10px; margin: 0; }
+  .pi-test p + p { margin-top: 6px; }
+  .pi-test i { font-size: 22px; flex: 0 0 auto; }
+  .pi-test-ok { border-left: 4px solid var(--t-ok, #2a9d8f); }
+  .pi-test-ok i { color: var(--t-ok, #2a9d8f); }
+  .pi-test-fail { border-left: 4px solid var(--t-danger, #d6464a); }
+  .pi-test-fail i { color: var(--t-danger, #d6464a); }
+  .pi-test-hint { color: var(--t-muted); font-size: 13px; padding-left: 32px; }
+  .pi-test-hint code { font-family: var(--t-font-mono); padding: 1px 4px; background: var(--t-surface-hover); border-radius: 2px; }
+</style>
+{% endblock %}

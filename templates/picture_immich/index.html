@@ -1,0 +1,91 @@
+{% extends "_base.html" %}
+{% from "_components.html" import card_head, button, empty_state %}
+{% block title %}Immich, Tesserae{% endblock %}
+
+{% block main %}
+<div class="page-head">
+  <h1><i class="ph-bold ph-images-square" aria-hidden="true"></i> Immich</h1>
+  <p class="page-blurb">Saved Immich connections. Each library is a URL plus an API key; cells reference one by name in the editor. API keys are wrapped at rest with the same SecretBox the rest of Tesserae uses.</p>
+</div>
+
+<section class="card">
+  {{ card_head('Libraries', icon_name='database', level=2,
+               blurb='Pick a library in the cell editor to draw photos from it.') }}
+
+  {% if libraries %}
+  <ul class="pi-libs">
+    {% for lib in libraries %}
+    <li class="pi-lib-row">
+      <a class="pi-lib-link" href="{{ url_for('picture_immich_admin.show_library', library_id=lib.id) }}">
+        <i class="ph-bold ph-database pi-lib-icon" aria-hidden="true"></i>
+        <span class="pi-lib-body">
+          <span class="pi-lib-name">{{ lib.name }}</span>
+          <span class="pi-lib-url">{{ lib.url }}</span>
+        </span>
+        {% if lib.has_key %}
+        <span class="pi-lib-tag pi-lib-tag-ok"><i class="ph ph-key" aria-hidden="true"></i>Key set</span>
+        {% else %}
+        <span class="pi-lib-tag pi-lib-tag-warn"><i class="ph ph-warning" aria-hidden="true"></i>No key</span>
+        {% endif %}
+        <i class="ph ph-caret-right pi-lib-caret" aria-hidden="true"></i>
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  {{ empty_state('database', 'No libraries yet',
+                 blurb='Add an Immich connection below. You can add as many as you like; cells pick one in the editor.') }}
+  {% endif %}
+
+  <div class="actions">
+    <a class="btn btn-primary" href="{{ url_for('picture_immich_admin.new_library') }}">
+      <i class="ph ph-plus" aria-hidden="true"></i>
+      <span>Add Immich library</span>
+    </a>
+  </div>
+</section>
+
+<style>
+  .pi-libs { list-style: none; margin: 0 0 var(--t-space-3); padding: 0; display: grid; gap: 6px; }
+  .pi-lib-row { margin: 0; }
+  .pi-lib-link {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--t-border);
+    border-radius: 6px;
+    text-decoration: none;
+    color: var(--t-fg);
+    background: var(--t-surface);
+    transition: background 120ms ease, border-color 120ms ease;
+  }
+  .pi-lib-link:hover { background: var(--t-surface-hover); border-color: var(--t-border-strong); }
+  .pi-lib-icon { font-size: 22px; color: var(--t-accent); }
+  .pi-lib-body { display: grid; gap: 2px; min-width: 0; }
+  .pi-lib-name { font-weight: 700; font-size: 15px; }
+  .pi-lib-url {
+    font-size: 12px;
+    color: var(--t-muted);
+    font-family: var(--t-font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pi-lib-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 2px;
+  }
+  .pi-lib-tag-ok { background: var(--t-surface-hover); color: var(--t-fg-soft); }
+  .pi-lib-tag-warn { background: var(--t-warn-bg, #fde7c2); color: var(--t-warn-fg, #7a4a00); }
+  .pi-lib-caret { color: var(--t-muted); }
+</style>
+{% endblock %}

@@ -1,0 +1,59 @@
+{
+  "tesserae_compat": "1.x",
+  "name": "Picture, Immich",
+  "version": "0.1.0",
+  "kind": "widget",
+  "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets → Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random library and random album modes also supported.",
+  "icon": "ph-images-square",
+  "supports": {
+    "sizes": ["sm", "md", "lg"]
+  },
+  "cell_options": [
+    {
+      "name": "library_id",
+      "type": "select",
+      "label": "Library",
+      "default": "",
+      "choices_from": "libraries"
+    },
+    {
+      "name": "mode",
+      "type": "select",
+      "label": "Mode",
+      "default": "memory",
+      "choices": [
+        {"value": "memory",       "label": "Today's memory"},
+        {"value": "random",       "label": "Random photo"},
+        {"value": "random_album", "label": "Random from album"}
+      ]
+    },
+    {
+      "name": "album_id",
+      "type": "select",
+      "label": "Album (random_album only)",
+      "default": "",
+      "choices_from": "albums"
+    },
+    {
+      "name": "scale",
+      "type": "select",
+      "label": "Scale",
+      "default": "fit",
+      "choices": [
+        {"value": "fit",    "label": "Fit (letterbox)"},
+        {"value": "fill",   "label": "Fill (crop to cover)"},
+        {"value": "center", "label": "Center (no scaling)"}
+      ]
+    },
+    {
+      "name": "show_caption",
+      "type": "boolean",
+      "label": "Show date / location caption",
+      "default": true
+    }
+  ],
+  "render": {
+    "dither": "floyd-steinberg",
+    "full_bleed": true
+  }
+}
