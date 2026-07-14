@@ -127,6 +127,51 @@ def test_random_falls_back_to_legacy_get(monkeypatch) -> None:
     assert out == [{"id": "legacy", "originalMimeType": "image/png"}]
 
 
+def test_album_uses_search_random_with_albumids(monkeypatch) -> None:
+    # Immich v3's GET /api/albums/{id} no longer embeds assets, so album
+    # mode must query POST /api/search/random with albumIds. Confirm the
+    # album id is passed through in the request body.
+    server = _load_server()
+    seen: dict = {}
+
+    def fake_post(url, headers, body, timeout):
+        seen["url"] = url
+        seen["body"] = body
+        return [{"id": "in_album", "originalMimeType": "image/jpeg"}]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    monkeypatch.setattr(
+        server,
+        "fetch_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no legacy")),
+    )
+    out = server._fetch_random_assets("http://immich", "key", "album-123")
+    assert out == [{"id": "in_album", "originalMimeType": "image/jpeg"}]
+    assert seen["url"].endswith("/api/search/random")
+    assert seen["body"] == {"size": 20, "albumIds": ["album-123"]}
+
+
+def test_album_falls_back_to_album_detail_assets(monkeypatch) -> None:
+    # Pre-v3 servers: POST search/random may not exist, so fall back to the
+    # album detail endpoint and read its embedded assets array.
+    server = _load_server()
+
+    def fake_post(url, headers, body, timeout):
+        raise RuntimeError("404")
+
+    def fake_get(url, **kwargs):
+        assert "/api/albums/album-123" in url
+        return {
+            "id": "album-123",
+            "assets": [{"id": "legacy_album", "originalMimeType": "image/png"}],
+        }
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    out = server._fetch_random_assets("http://immich", "key", "album-123")
+    assert out == [{"id": "legacy_album", "originalMimeType": "image/png"}]
+
+
 def test_random_returns_none_when_both_paths_fail(monkeypatch) -> None:
     server = _load_server()
     monkeypatch.setattr(

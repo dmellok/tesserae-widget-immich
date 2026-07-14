@@ -53,8 +53,10 @@ Generate the API key from your Immich profile under
 - Immich OpenAPI `3.0.0-rc.2` (Immich server `v2.7.x` and the v3
   release line). The widget hits these endpoints:
   `/api/server/ping`, `/api/memories?for=<date>`,
-  `/api/search/random` (falling back to the legacy
-  `/api/assets/random` on pre-v3 servers), `/api/albums`, and
+  `/api/search/random` (for whole-library and per-album random,
+  the latter via `albumIds`; falling back to the legacy
+  `/api/assets/random` and `/api/albums/<id>` on pre-v3 servers),
+  `/api/albums`, and
   `/api/assets/<id>/thumbnail?size=preview` (with a fallback
   cascade to `?size=thumbnail` then `/original`). If a future
   Immich release changes these paths, the widget will fail loudly

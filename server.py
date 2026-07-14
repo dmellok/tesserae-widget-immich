@@ -13,9 +13,11 @@ Modes:
   a previous year. Falls back to ``random`` when no memory exists for
   the date.
 * ``random``       — random asset from the whole library
-  (``/api/assets/random``).
+  (``POST /api/search/random``; legacy ``GET /api/assets/random``
+  fallback for pre-v3 servers).
 * ``random_album`` — random asset from a specific album
-  (``/api/albums/<id>``).
+  (``POST /api/search/random`` with ``albumIds``; legacy
+  ``GET /api/albums/<id>`` embedded-assets fallback for pre-v3).
 
 The browser/panel client never sees the API key. All image fetches go
 through ``GET /plugins/picture_immich/image/<library_id>/<asset_id>``,
@@ -319,26 +321,46 @@ def _is_browser_friendly(mime: str | None) -> bool:
     )
 
 
-def _fetch_random_assets(base: str, key: str) -> list[dict[str, Any]] | None:
-    """Fetch a batch of random assets, tolerant of the Immich API change.
+def _fetch_random_assets(
+    base: str, key: str, album_id: str | None = None
+) -> list[dict[str, Any]] | None:
+    """Fetch a batch of random assets, tolerant of the Immich API changes.
 
-    Immich v3 removed ``GET /api/assets/random`` in favour of
-    ``POST /api/search/random`` (body ``{"size": N}``); both return a flat
-    array of assets. Try the v3 endpoint first, fall back to the legacy
-    GET for pre-v3 servers. Returns the asset list, or ``None`` when both
-    paths fail (network / auth / an even older server)."""
+    Immich v3 reworked both paths this widget relied on:
+
+    * ``GET /api/assets/random`` was removed in favour of
+      ``POST /api/search/random`` (body ``{"size": N}``).
+    * ``GET /api/albums/{id}`` no longer embeds an ``assets`` array
+      (``AlbumResponseDto`` now carries only ``assetCount``); album assets
+      come from ``POST /api/search/random`` with ``albumIds``.
+
+    So the v3 path is one endpoint for both cases: POST search/random, with
+    ``albumIds`` added when ``album_id`` is given. Fall back to the legacy
+    GET (whole-library random, or the album detail's embedded ``assets``)
+    for pre-v3 servers. Returns the asset list, or ``None`` when both paths
+    fail (network / auth / an even older server)."""
     headers = _api_headers(key)
+    body: dict[str, Any] = {"size": 20}
+    if album_id:
+        body["albumIds"] = [album_id]
     try:
-        payload = _post_json(
-            f"{base}/api/search/random", headers, {"size": 20}, HTTP_TIMEOUT_S
-        )
+        payload = _post_json(f"{base}/api/search/random", headers, body, HTTP_TIMEOUT_S)
         if isinstance(payload, list):
             return payload
     except Exception as exc:
         logger.info(
             "picture_immich: search/random failed, trying legacy endpoint: %s", exc
         )
+    # Legacy (pre-v3) fallbacks.
     try:
+        if album_id:
+            payload = fetch_json(
+                f"{base}/api/albums/{urllib.parse.quote(album_id)}",
+                headers=headers,
+                timeout=HTTP_TIMEOUT_S,
+            )
+            assets = payload.get("assets") if isinstance(payload, dict) else None
+            return assets if isinstance(assets, list) else None
         payload = fetch_json(
             f"{base}/api/assets/random?count=20",
             headers=headers,
@@ -387,21 +409,10 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key and album_id):
         return None
-    try:
-        payload = fetch_json(
-            f"{base}/api/albums/{urllib.parse.quote(album_id)}",
-            headers=_api_headers(key),
-            timeout=HTTP_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.info("picture_immich: album fetch failed for %s: %s", album_id, exc)
+    payload = _fetch_random_assets(base, key, album_id)
+    if not payload:
         return None
-    if not isinstance(payload, dict):
-        return None
-    assets = payload.get("assets")
-    if not isinstance(assets, list) or not assets:
-        return None
-    pool = [a for a in assets if isinstance(a, dict) and a.get("id")]
+    pool = [a for a in payload if isinstance(a, dict) and a.get("id")]
     if not pool:
         return None
     random.shuffle(pool)  # noqa: S311  (display-only)
