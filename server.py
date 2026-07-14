@@ -24,7 +24,6 @@ which proxies to Immich's preview endpoint with the stored key.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import random
@@ -163,7 +162,9 @@ def _unwrap_token(stored: str) -> str:
     try:
         return str(box.unwrap(stored))
     except Exception:
-        logger.warning("picture_immich: stored API key can't be decrypted; treating as empty")
+        logger.warning(
+            "picture_immich: stored API key can't be decrypted; treating as empty"
+        )
         return ""
 
 
@@ -204,6 +205,22 @@ def _api_headers(api_key: str) -> dict[str, str]:
     }
 
 
+def _post_json(
+    url: str, headers: dict[str, str], body: dict[str, Any], timeout: float
+) -> Any:
+    """POST a JSON body and decode the JSON response.
+
+    ``app.plugin_http.fetch_json`` is GET-only, and Immich's random
+    search (the v3 replacement for the removed ``GET /api/assets/random``)
+    is a POST, so this is the one call that needs its own request."""
+    data = json.dumps(body).encode("utf-8")
+    req_headers = dict(headers)
+    req_headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _ping(url: str, api_key: str) -> tuple[bool, str]:
     """Return ``(ok, message)``. Used by the admin "Test" button."""
     base = url.rstrip("/")
@@ -232,7 +249,9 @@ def _list_albums(library: dict[str, Any]) -> list[dict[str, Any]]:
             timeout=HTTP_TIMEOUT_S,
         )
     except Exception as exc:
-        logger.info("picture_immich: list_albums failed for %s: %s", library.get("id"), exc)
+        logger.info(
+            "picture_immich: list_albums failed for %s: %s", library.get("id"), exc
+        )
         return []
     if not isinstance(payload, list):
         return []
@@ -268,7 +287,11 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(memory, dict):
             continue
         assets = memory.get("assets")
-        year_offset = memory.get("data", {}).get("year") if isinstance(memory.get("data"), dict) else None
+        year_offset = (
+            memory.get("data", {}).get("year")
+            if isinstance(memory.get("data"), dict)
+            else None
+        )
         if isinstance(assets, list):
             for asset in assets:
                 if isinstance(asset, dict) and isinstance(asset.get("id"), str):
@@ -291,7 +314,40 @@ def _is_browser_friendly(mime: str | None) -> bool:
     if not isinstance(mime, str):
         return False
     mime = mime.lower()
-    return any(mime.endswith(suffix) for suffix in ("/jpeg", "/jpg", "/png", "/webp", "/gif"))
+    return any(
+        mime.endswith(suffix) for suffix in ("/jpeg", "/jpg", "/png", "/webp", "/gif")
+    )
+
+
+def _fetch_random_assets(base: str, key: str) -> list[dict[str, Any]] | None:
+    """Fetch a batch of random assets, tolerant of the Immich API change.
+
+    Immich v3 removed ``GET /api/assets/random`` in favour of
+    ``POST /api/search/random`` (body ``{"size": N}``); both return a flat
+    array of assets. Try the v3 endpoint first, fall back to the legacy
+    GET for pre-v3 servers. Returns the asset list, or ``None`` when both
+    paths fail (network / auth / an even older server)."""
+    headers = _api_headers(key)
+    try:
+        payload = _post_json(
+            f"{base}/api/search/random", headers, {"size": 20}, HTTP_TIMEOUT_S
+        )
+        if isinstance(payload, list):
+            return payload
+    except Exception as exc:
+        logger.info(
+            "picture_immich: search/random failed, trying legacy endpoint: %s", exc
+        )
+    try:
+        payload = fetch_json(
+            f"{base}/api/assets/random?count=20",
+            headers=headers,
+            timeout=HTTP_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.info("picture_immich: random fetch failed: %s", exc)
+        return None
+    return payload if isinstance(payload, list) else None
 
 
 def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
@@ -302,16 +358,8 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
         return None
-    try:
-        payload = fetch_json(
-            f"{base}/api/assets/random?count=20",
-            headers=_api_headers(key),
-            timeout=HTTP_TIMEOUT_S,
-        )
-    except Exception as exc:
-        logger.info("picture_immich: random fetch failed: %s", exc)
-        return None
-    if not isinstance(payload, list) or not payload:
+    payload = _fetch_random_assets(base, key)
+    if not payload:
         return None
     candidates = [a for a in payload if isinstance(a, dict) and a.get("id")]
     if not candidates:
@@ -322,7 +370,9 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
     if _HEIF_AVAILABLE:
         asset = candidates[0]
     else:
-        preferred = [a for a in candidates if _is_browser_friendly(a.get("originalMimeType"))]
+        preferred = [
+            a for a in candidates if _is_browser_friendly(a.get("originalMimeType"))
+        ]
         asset = preferred[0] if preferred else candidates[0]
     return {
         "asset_id": asset.get("id"),
@@ -380,8 +430,13 @@ def choices(name: str) -> list[dict[str, Any]]:
     if name == "libraries":
         libraries = _load_libraries(data_dir)
         if not libraries:
-            return [{"value": "", "label": "Add an Immich library under Widgets → Immich"}]
-        return [{"value": lib["id"], "label": lib.get("name") or lib["id"]} for lib in libraries]
+            return [
+                {"value": "", "label": "Add an Immich library under Widgets → Immich"}
+            ]
+        return [
+            {"value": lib["id"], "label": lib.get("name") or lib["id"]}
+            for lib in libraries
+        ]
     if name == "albums":
         # The cell-editor doesn't know which library is selected at
         # choices() time, so we collapse across every configured
@@ -432,7 +487,11 @@ def fetch(
     # Friendlier error when the chosen asset is HEIC and the host
     # doesn't have ``pillow-heif`` installed. Better to surface
     # "install pillow-heif" than paint a blank tile.
-    if not _HEIF_AVAILABLE and isinstance(asset.get("mime"), str) and "heic" in asset["mime"].lower():
+    if (
+        not _HEIF_AVAILABLE
+        and isinstance(asset.get("mime"), str)
+        and "heic" in asset["mime"].lower()
+    ):
         return {
             "error": (
                 "This asset is HEIC and the Tesserae host has no HEIF decoder. "
@@ -531,7 +590,9 @@ def blueprint() -> Blueprint:
         api_key = (request.form.get("api_key") or "").strip()
         if not name or not url:
             flash("Name and URL are required.", "warn")
-            return redirect(url_for("picture_immich_admin.show_library", library_id=library_id))
+            return redirect(
+                url_for("picture_immich_admin.show_library", library_id=library_id)
+            )
         target["name"] = name
         target["url"] = url
         # Empty ``api_key`` field on edit means "leave as-is"; the
@@ -563,7 +624,9 @@ def blueprint() -> Blueprint:
         library = _by_id(_data_dir(), library_id)
         if library is None:
             abort(404)
-        ok, msg = _ping(library["url"], _unwrap_token(library.get("api_key_secret", "")))
+        ok, msg = _ping(
+            library["url"], _unwrap_token(library.get("api_key_secret", ""))
+        )
         return render_template(
             "picture_immich/library.html",
             library=_public_view(library),
@@ -651,7 +714,9 @@ def _downscale_jpeg(raw: bytes, content_type: str) -> tuple[bytes, str]:
     try:
         with Image.open(io.BytesIO(raw)) as im:
             im = ImageOps.exif_transpose(im) or im
-            im.thumbnail((PROXY_MAX_EDGE_PX, PROXY_MAX_EDGE_PX), Image.Resampling.LANCZOS)
+            im.thumbnail(
+                (PROXY_MAX_EDGE_PX, PROXY_MAX_EDGE_PX), Image.Resampling.LANCZOS
+            )
             if im.mode not in {"RGB", "L"}:
                 im = im.convert("RGB")
             buf = io.BytesIO()

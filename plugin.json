@@ -1,7 +1,7 @@
 {
   "tesserae_compat": "1.x",
   "name": "Picture, Immich",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "kind": "widget",
   "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets \u2192 Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random library and random album modes also supported.",
   "icon": "ph-images-square",

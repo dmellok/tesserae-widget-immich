@@ -60,8 +60,83 @@ def test_server_module_exposes_plugin_contract() -> None:
     assert callable(server.blueprint)
     bp = server.blueprint()
     assert isinstance(bp, flask.Blueprint)
-    rule_paths = {r.rule for r in bp.deferred_functions and []}  # populated on register
     # Without actually registering against an app, we can't enumerate
     # rules. Just confirm the blueprint object came back; rule-level
     # checks live in the host-side widget-loader tests.
     assert bp.name == "picture_immich_admin"
+
+
+def _load_server():
+    """Import the widget's server module, or skip if the host isn't on
+    the path (keeps the widget repo's standalone CI green)."""
+    pytest.importorskip("flask")
+    pytest.importorskip("PIL")
+    try:
+        import app.plugin_http  # noqa: F401
+    except Exception:
+        pytest.skip("host app.plugin_http not importable; skipping server probe")
+    import sys
+
+    sys.path.insert(0, str(ROOT))
+    try:
+        import server  # type: ignore[import-not-found]
+    finally:
+        if str(ROOT) in sys.path:
+            sys.path.remove(str(ROOT))
+    return server
+
+
+def test_random_prefers_v3_search_endpoint(monkeypatch) -> None:
+    # Immich v3 removed GET /api/assets/random for POST /api/search/random.
+    # The primary path must hit the new endpoint; the legacy GET must not
+    # be called when the new one succeeds.
+    server = _load_server()
+    calls: list[str] = []
+
+    def fake_post(url, headers, body, timeout):
+        calls.append(("POST", url, body))
+        return [{"id": "a1", "originalMimeType": "image/jpeg"}]
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url))
+        raise AssertionError("legacy GET should not be called on v3 success")
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    out = server._fetch_random_assets("http://immich", "key")
+    assert out == [{"id": "a1", "originalMimeType": "image/jpeg"}]
+    assert calls[0][0] == "POST" and calls[0][1].endswith("/api/search/random")
+    assert calls[0][2] == {"size": 20}
+
+
+def test_random_falls_back_to_legacy_get(monkeypatch) -> None:
+    # Pre-v3 servers 404 the new endpoint; the widget must fall back to
+    # the legacy GET so existing installs keep working.
+    server = _load_server()
+
+    def fake_post(url, headers, body, timeout):
+        raise RuntimeError("404 Not Found")
+
+    def fake_get(url, **kwargs):
+        assert url.endswith("/api/assets/random?count=20")
+        return [{"id": "legacy", "originalMimeType": "image/png"}]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    out = server._fetch_random_assets("http://immich", "key")
+    assert out == [{"id": "legacy", "originalMimeType": "image/png"}]
+
+
+def test_random_returns_none_when_both_paths_fail(monkeypatch) -> None:
+    server = _load_server()
+    monkeypatch.setattr(
+        server,
+        "_post_json",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(
+        server,
+        "fetch_json",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert server._fetch_random_assets("http://immich", "key") is None
