@@ -106,7 +106,9 @@ def test_random_prefers_v3_search_endpoint(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key")
     assert out == [{"id": "a1", "originalMimeType": "image/jpeg"}]
     assert calls[0][0] == "POST" and calls[0][1].endswith("/api/search/random")
-    assert calls[0][2] == {"size": 20}
+    # ``withExif`` must be requested or Immich omits ``exifInfo`` and
+    # the caption loses its location.
+    assert calls[0][2] == {"size": 20, "withExif": True}
 
 
 def test_random_falls_back_to_legacy_get(monkeypatch) -> None:
@@ -148,7 +150,7 @@ def test_album_uses_search_random_with_albumids(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key", "album-123")
     assert out == [{"id": "in_album", "originalMimeType": "image/jpeg"}]
     assert seen["url"].endswith("/api/search/random")
-    assert seen["body"] == {"size": 20, "albumIds": ["album-123"]}
+    assert seen["body"] == {"size": 20, "withExif": True, "albumIds": ["album-123"]}
 
 
 def test_album_falls_back_to_album_detail_assets(monkeypatch) -> None:
@@ -213,6 +215,33 @@ def test_location_of_reads_reverse_geocoded_exif() -> None:
     assert server._location_of({"exifInfo": {"city": None, "country": "  "}}) is None
     assert server._location_of({"exifInfo": {}}) is None
     assert server._location_of({}) is None
+
+
+def test_memory_mode_enriches_location_from_asset_detail(monkeypatch) -> None:
+    # Immich's memories response embeds assets without the exif join,
+    # so memory mode must fetch the asset detail to get the location.
+    server = _load_server()
+
+    def fake_get(url, **kwargs):
+        if "/api/memories" in url:
+            return [
+                {
+                    "data": {"year": 2},
+                    "assets": [{"id": "m1", "fileCreatedAt": "2024-08-28T00:00:00Z"}],
+                }
+            ]
+        assert url.endswith("/api/assets/m1")
+        return {
+            "id": "m1",
+            "exifInfo": {"city": "Sausalito", "country": "United States of America"},
+        }
+
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
+    lib = {"url": "http://immich", "api_key_secret": "key"}
+    picked = server._pick_asset_memory(lib)
+    assert picked["asset_id"] == "m1"
+    assert picked["location"] == "Sausalito, United States of America"
 
 
 def test_pickers_carry_location(monkeypatch) -> None:

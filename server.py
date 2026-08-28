@@ -302,19 +302,27 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
         return None
     chosen = random.choice(flat)  # noqa: S311  (display-only, not crypto)
     asset = chosen["asset"]
+    # Memories assets come straight off the asset table with no exif
+    # join (``selectAll('asset')`` in Immich's memory repository), so
+    # the location has to come from the asset-detail endpoint. Skip the
+    # extra fetch when exif WAS embedded and simply has no place data.
+    location = _location_of(asset)
+    if location is None and not isinstance(asset.get("exifInfo"), dict):
+        location = _detail_location(base, key, asset["id"])
     return {
         "asset_id": asset["id"],
         "taken_at": asset.get("fileCreatedAt") or asset.get("localDateTime"),
         "memory_year": chosen.get("memory_year"),
-        "location": _location_of(asset),
+        "location": location,
     }
 
 
 def _location_of(asset: dict[str, Any]) -> str | None:
     """Human place string from the asset's ``exifInfo``. Immich
-    reverse-geocodes GPS tags into city / state / country and embeds
-    them on asset payloads from search/random, memories, and album
-    detail responses alike."""
+    reverse-geocodes GPS tags into city / state / country. Search
+    responses only carry ``exifInfo`` when the request asks for it
+    (``withExif``); memories responses never do, hence
+    ``_detail_location``."""
     exif = asset.get("exifInfo")
     if not isinstance(exif, dict):
         return None
@@ -326,6 +334,24 @@ def _location_of(asset: dict[str, Any]) -> str | None:
     # ``dict.fromkeys`` dedupes city-state places like Singapore
     # while keeping order.
     return ", ".join(dict.fromkeys(parts)) or None
+
+
+def _detail_location(base: str, key: str, asset_id: str) -> str | None:
+    """Fetch ``GET /api/assets/{id}`` (which always loads the exif
+    relation) and extract the place string. One extra round trip, paid
+    only when the asset payload in hand had no ``exifInfo``."""
+    try:
+        payload = fetch_json(
+            f"{base}/api/assets/{urllib.parse.quote(asset_id, safe='')}",
+            headers=_api_headers(key),
+            timeout=HTTP_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.info(
+            "picture_immich: asset detail fetch failed for %s: %s", asset_id, exc
+        )
+        return None
+    return _location_of(payload) if isinstance(payload, dict) else None
 
 
 def _is_browser_friendly(mime: str | None) -> bool:
@@ -359,7 +385,10 @@ def _fetch_random_assets(
     for pre-v3 servers. Returns the asset list, or ``None`` when both paths
     fail (network / auth / an even older server)."""
     headers = _api_headers(key)
-    body: dict[str, Any] = {"size": 20}
+    # ``withExif`` matters: without it Immich omits ``exifInfo`` from
+    # search results entirely, and the caption loses its reverse-geocoded
+    # city / state / country.
+    body: dict[str, Any] = {"size": 20, "withExif": True}
     if album_id:
         body["albumIds"] = [album_id]
     try:
