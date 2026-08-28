@@ -36,6 +36,7 @@ function captionFor(data) {
       );
     }
   }
+  if (data.location) parts.push(data.location);
   if (data.library_name) parts.push(data.library_name);
   return parts.join("  ·  ");
 }

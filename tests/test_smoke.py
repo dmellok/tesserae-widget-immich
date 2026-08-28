@@ -185,3 +185,48 @@ def test_random_returns_none_when_both_paths_fail(monkeypatch) -> None:
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert server._fetch_random_assets("http://immich", "key") is None
+
+
+def test_location_of_reads_reverse_geocoded_exif() -> None:
+    # ``exifInfo`` city / state / country come from Immich's reverse
+    # geocoder; the caption shows them joined, deduped, and skips
+    # blanks and non-string values.
+    server = _load_server()
+    assert (
+        server._location_of(
+            {
+                "exifInfo": {
+                    "city": "Melbourne",
+                    "state": "Victoria",
+                    "country": "Australia",
+                }
+            }
+        )
+        == "Melbourne, Victoria, Australia"
+    )
+    assert (
+        server._location_of(
+            {"exifInfo": {"city": "Singapore", "state": "", "country": "Singapore"}}
+        )
+        == "Singapore"
+    )
+    assert server._location_of({"exifInfo": {"city": None, "country": "  "}}) is None
+    assert server._location_of({"exifInfo": {}}) is None
+    assert server._location_of({}) is None
+
+
+def test_pickers_carry_location(monkeypatch) -> None:
+    server = _load_server()
+    asset = {
+        "id": "a1",
+        "originalMimeType": "image/jpeg",
+        "fileCreatedAt": "2024-03-15T00:00:00Z",
+        "exifInfo": {"city": "Lyon", "country": "France"},
+    }
+    monkeypatch.setattr(server, "_fetch_random_assets", lambda *a, **k: [asset])
+    monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
+    lib = {"url": "http://immich", "api_key_secret": "key"}
+    picked = server._pick_asset_random(lib)
+    assert picked["location"] == "Lyon, France"
+    picked = server._pick_asset_album(lib, "album-1")
+    assert picked["location"] == "Lyon, France"

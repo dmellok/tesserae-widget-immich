@@ -306,7 +306,26 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
         "asset_id": asset["id"],
         "taken_at": asset.get("fileCreatedAt") or asset.get("localDateTime"),
         "memory_year": chosen.get("memory_year"),
+        "location": _location_of(asset),
     }
+
+
+def _location_of(asset: dict[str, Any]) -> str | None:
+    """Human place string from the asset's ``exifInfo``. Immich
+    reverse-geocodes GPS tags into city / state / country and embeds
+    them on asset payloads from search/random, memories, and album
+    detail responses alike."""
+    exif = asset.get("exifInfo")
+    if not isinstance(exif, dict):
+        return None
+    parts = [
+        str(v).strip()
+        for v in (exif.get("city"), exif.get("state"), exif.get("country"))
+        if isinstance(v, str) and v.strip()
+    ]
+    # ``dict.fromkeys`` dedupes city-state places like Singapore
+    # while keeping order.
+    return ", ".join(dict.fromkeys(parts)) or None
 
 
 def _is_browser_friendly(mime: str | None) -> bool:
@@ -401,6 +420,7 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
         "taken_at": asset.get("fileCreatedAt") or asset.get("localDateTime"),
         "memory_year": None,
         "mime": asset.get("originalMimeType"),
+        "location": _location_of(asset),
     }
 
 
@@ -428,6 +448,7 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
         "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
+        "location": _location_of(chosen),
     }
 
 
@@ -523,6 +544,7 @@ def fetch(
         "asset_id": asset["asset_id"],
         "taken_at": asset.get("taken_at"),
         "memory_year": asset.get("memory_year"),
+        "location": asset.get("location"),
         "image_url": f"/plugins/picture_immich/image/{safe_library}/{safe_asset}",
         "scale": options.get("scale") or "fit",
         "show_caption": bool(options.get("show_caption", True)),
