@@ -511,11 +511,100 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
+    """Every image id in the album, whoever owns it.
+
+    ``POST /api/search/random`` with ``albumIds`` only returns assets owned
+    by the API key's user, so on an album shared with someone else their
+    photos never come up. The timeline API is what Immich's own album page
+    uses and covers every member's assets: ``GET /api/timeline/buckets``
+    lists the album's time buckets, then ``GET /api/timeline/bucket`` per
+    bucket answers in columns (``id``, ``isImage``, ``isTrashed``, ...).
+    Returns ``None`` when the timeline API is unavailable (e.g. an older
+    server) so the caller can fall back."""
+    headers = _api_headers(key)
+    quoted = urllib.parse.quote(album_id, safe="")
+    try:
+        buckets = fetch_json(
+            f"{base}/api/timeline/buckets?albumId={quoted}",
+            headers=headers,
+            timeout=HTTP_TIMEOUT_S,
+        )
+        if not isinstance(buckets, list):
+            return None
+        ids: list[str] = []
+        for bucket in buckets:
+            time_bucket = bucket.get("timeBucket") if isinstance(bucket, dict) else None
+            if not isinstance(time_bucket, str):
+                continue
+            query = urllib.parse.urlencode({"albumId": album_id, "timeBucket": time_bucket})
+            cols = fetch_json(
+                f"{base}/api/timeline/bucket?{query}",
+                headers=headers,
+                timeout=HTTP_TIMEOUT_S,
+            )
+            if not isinstance(cols, dict) or not isinstance(cols.get("id"), list):
+                continue
+            n = len(cols["id"])
+            is_image = cols.get("isImage") or [True] * n
+            trashed = cols.get("isTrashed") or [False] * n
+            ids += [
+                asset_id
+                for asset_id, image, gone in zip(cols["id"], is_image, trashed, strict=False)
+                if isinstance(asset_id, str) and image and not gone
+            ]
+    except Exception as exc:
+        logger.info("picture_immich: album timeline failed for %s: %s", album_id, exc)
+        return None
+    return ids
+
+
+def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, Any] | None:
+    """Random album asset from the timeline listing, with its detail
+    (``GET /api/assets/{id}``) for the date, MIME type and place. Without
+    pillow-heif, tries a few candidates for a browser-friendly one."""
+    ids = _album_image_ids(base, key, album_id)
+    if not ids:
+        return None
+    random.shuffle(ids)  # noqa: S311  (display-only)
+    chosen: dict[str, Any] | None = None
+    fallback: dict[str, Any] | None = None
+    for asset_id in ids[:5]:
+        try:
+            asset = fetch_json(
+                f"{base}/api/assets/{urllib.parse.quote(asset_id, safe='')}",
+                headers=_api_headers(key),
+                timeout=HTTP_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.info("picture_immich: asset detail fetch failed for %s: %s", asset_id, exc)
+            continue
+        if not isinstance(asset, dict) or not asset.get("id"):
+            continue
+        fallback = fallback or asset
+        if _HEIF_AVAILABLE or _is_browser_friendly(asset.get("originalMimeType")):
+            chosen = asset
+            break
+    chosen = chosen or fallback
+    if chosen is None:
+        return None
+    return {
+        "asset_id": chosen.get("id"),
+        "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
+        "memory_year": None,
+        "mime": chosen.get("originalMimeType"),
+        "location": _location_of(chosen),
+    }
+
+
 def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] | None:
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key and album_id):
         return None
+    picked = _pick_asset_album_timeline(base, key, album_id)
+    if picked is not None:
+        return picked
     payload = _fetch_random_assets(base, key, album_id)
     if not payload:
         return None

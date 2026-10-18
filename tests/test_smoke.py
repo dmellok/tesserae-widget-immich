@@ -260,9 +260,107 @@ def test_pickers_carry_location(monkeypatch) -> None:
         "exifInfo": {"city": "Lyon", "country": "France"},
     }
     monkeypatch.setattr(server, "_fetch_random_assets", lambda *a, **k: [asset])
+    monkeypatch.setattr(server, "_album_image_ids", lambda *a, **k: None)
     monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
     lib = {"url": "http://immich", "api_key_secret": "key"}
     picked = server._pick_asset_random(lib)
     assert picked["location"] == "Lyon, France"
     picked = server._pick_asset_album(lib, "album-1")
     assert picked["location"] == "Lyon, France"
+
+
+class _FakeTimeline:
+    """Fake Immich for the album timeline path: two time buckets, assets
+    owned by two users, one trashed asset and one video to skip."""
+
+    def __init__(self, mimes: dict | None = None) -> None:
+        self.mimes = mimes or {}
+        self.buckets = {
+            "2026-08-01T00:00:00.000Z": {
+                "id": ["mine", "partner-1", "trashed", "video"],
+                "ownerId": ["me", "partner", "partner", "me"],
+                "isImage": [True, True, True, False],
+                "isTrashed": [False, False, True, False],
+            },
+            "2026-07-01T00:00:00.000Z": {
+                "id": ["partner-2"],
+                "ownerId": ["partner"],
+                "isImage": [True],
+                "isTrashed": [False],
+            },
+        }
+
+    def __call__(self, url, **kwargs):
+        import urllib.parse
+
+        parsed = urllib.parse.urlparse(url)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        if parsed.path == "/api/timeline/buckets":
+            assert query["albumId"] == "album-1"
+            return [{"timeBucket": tb, "count": len(c["id"])} for tb, c in self.buckets.items()]
+        if parsed.path == "/api/timeline/bucket":
+            assert query["albumId"] == "album-1"
+            return self.buckets[query["timeBucket"]]
+        if parsed.path.startswith("/api/assets/"):
+            asset_id = parsed.path.rsplit("/", 1)[1]
+            return {
+                "id": asset_id,
+                "originalMimeType": self.mimes.get(asset_id, "image/jpeg"),
+                "fileCreatedAt": "2026-08-22T10:00:00Z",
+                "exifInfo": {"city": "Otterlo", "country": "Netherlands"},
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+
+def test_album_timeline_lists_every_members_images(monkeypatch) -> None:
+    # Shared albums: search/random only returns the key owner's assets, so
+    # album ids come from the timeline API, which covers every member's.
+    server = _load_server()
+    monkeypatch.setattr(server, "fetch_json", _FakeTimeline())
+    ids = server._album_image_ids("http://immich", "key", "album-1")
+    assert sorted(ids) == ["mine", "partner-1", "partner-2"]
+
+
+def test_album_pick_covers_partner_assets(monkeypatch) -> None:
+    server = _load_server()
+    monkeypatch.setattr(server, "fetch_json", _FakeTimeline())
+    monkeypatch.setattr(
+        server,
+        "_post_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no search/random")),
+    )
+    monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
+    lib = {"url": "http://immich", "api_key_secret": "key"}
+    seen = {server._pick_asset_album(lib, "album-1")["asset_id"] for _ in range(60)}
+    assert seen == {"mine", "partner-1", "partner-2"}
+    picked = server._pick_asset_album(lib, "album-1")
+    assert picked["location"] == "Otterlo, Netherlands"
+    assert picked["taken_at"] == "2026-08-22T10:00:00Z"
+
+
+def test_album_pick_skips_heic_without_decoder(monkeypatch) -> None:
+    server = _load_server()
+    monkeypatch.setattr(server, "_HEIF_AVAILABLE", False)
+    monkeypatch.setattr(
+        server, "fetch_json", _FakeTimeline({"mine": "image/heic", "partner-1": "image/heic"})
+    )
+    for _ in range(20):
+        picked = server._pick_asset_album_timeline("http://immich", "key", "album-1")
+        assert picked["asset_id"] == "partner-2"
+
+
+def test_album_falls_back_to_search_random_without_timeline(monkeypatch) -> None:
+    server = _load_server()
+
+    def fake_get(url, **kwargs):
+        raise RuntimeError("404 no timeline API")
+
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    monkeypatch.setattr(
+        server,
+        "_post_json",
+        lambda *a, **k: [{"id": "own", "originalMimeType": "image/jpeg"}],
+    )
+    monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
+    lib = {"url": "http://immich", "api_key_secret": "key"}
+    assert server._pick_asset_album(lib, "album-1")["asset_id"] == "own"

@@ -20,7 +20,8 @@ Immich servers.
 | `memory`         | "On this day in past years." Falls back to `random`   |
 |                  | when Immich returns no memory for today's date.       |
 | `random`         | A single random asset from the whole library.         |
-| `random_album`   | A single random asset from the chosen album.          |
+| `random_album`   | A single random asset from the chosen album,          |
+|                  | including other members' photos in a shared album.    |
 
 ### Random from tag (`random_tag`)
 
@@ -69,9 +70,13 @@ permission" instead of your tags.
 - Immich OpenAPI `3.0.0-rc.2` (Immich server `v2.7.x` and the v3
   release line). The widget hits these endpoints:
   `/api/server/ping`, `/api/memories?for=<date>`,
-  `/api/search/random` (for whole-library and per-album random,
-  the latter via `albumIds`; falling back to the legacy
+  `/api/search/random` (for whole-library random, and per-album
+  random via `albumIds` as a fallback; falling back to the legacy
   `/api/assets/random` and `/api/albums/<id>` on pre-v3 servers),
+  `/api/timeline/buckets` + `/api/timeline/bucket?albumId=` and
+  `/api/assets/<id>` (per-album random: unlike `search/random`, the
+  timeline covers every member's assets of a shared album; same
+  `asset.read` permission as `search/random`),
   `/api/albums`, and
   `/api/assets/<id>/thumbnail?size=preview` (with a fallback
   cascade to `?size=thumbnail` then `/original`). If a future
