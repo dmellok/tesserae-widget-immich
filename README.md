@@ -22,6 +22,16 @@ Immich servers.
 | `random`         | A single random asset from the whole library.         |
 | `random_album`   | A single random asset from the chosen album.          |
 
+### Random from tag (`random_tag`)
+
+Picks a single random asset carrying the chosen tag, so you can tag
+the photos you want on your displays in Immich and point a cell at
+that tag. The tag picker reads `/api/tags` and lists each tag by its
+full path (`Displays/Kitchen`), since Immich tags can be nested. The
+photo comes from `/api/search/random` with `tagIds`. The API key
+needs the `tag.read` permission; without it the picker shows "API key
+needs the tag.read permission" instead of your tags.
+
 ## Install (when published to the catalog)
 
 Open **Settings → Widgets → Browse** in Tesserae and search for
@@ -47,6 +57,12 @@ Each library record stores:
 
 Generate the API key from your Immich profile under
 **Account Settings → API Keys**. A read-only scope is enough.
+If you pick individual permissions instead of "All", the widget
+needs `asset.read`, `asset.view`, `asset.download` (originals not
+yet thumbnailed), `album.read` (album picker), `memory.read` (memory
+mode), and `tag.read` (tag picker). Without
+`tag.read` the tag picker shows "API key needs the tag.read
+permission" instead of your tags.
 
 ## Tested against
 

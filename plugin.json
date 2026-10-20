@@ -1,9 +1,9 @@
 {
   "tesserae_compat": "1.x",
   "name": "Picture, Immich",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "kind": "widget",
-  "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets \u2192 Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random library and random album modes also supported.",
+  "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets \u2192 Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random library, random album, and random tag modes also supported.",
   "icon": "ph-images-square",
   "supports": {
     "sizes": [
@@ -37,6 +37,10 @@
         {
           "value": "random_album",
           "label": "Random from album"
+        },
+        {
+          "value": "random_tag",
+          "label": "Random from tag"
         }
       ]
     },
@@ -46,6 +50,13 @@
       "label": "Album (random_album only)",
       "default": "",
       "choices_from": "albums"
+    },
+    {
+      "name": "tag_id",
+      "type": "select",
+      "label": "Tag (random_tag only)",
+      "default": "",
+      "choices_from": "tags"
     },
     {
       "name": "scale",

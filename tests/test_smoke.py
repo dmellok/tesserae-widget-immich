@@ -29,7 +29,14 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
     assert manifest["name"] == "Picture, Immich"
     assert manifest["kind"] == "widget"
     names = {opt["name"] for opt in manifest["cell_options"]}
-    assert names == {"library_id", "mode", "album_id", "scale", "show_caption"}
+    assert names == {
+        "library_id",
+        "mode",
+        "album_id",
+        "tag_id",
+        "scale",
+        "show_caption",
+    }
     library_opt = next(o for o in manifest["cell_options"] if o["name"] == "library_id")
     assert library_opt["choices_from"] == "libraries"
     album_opt = next(o for o in manifest["cell_options"] if o["name"] == "album_id")

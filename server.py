@@ -18,6 +18,10 @@ Modes:
 * ``random_album`` — random asset from a specific album
   (``POST /api/search/random`` with ``albumIds``; legacy
   ``GET /api/albums/<id>`` embedded-assets fallback for pre-v3).
+* ``random_tag``   — random asset carrying a specific tag
+  (``POST /api/search/random`` with ``tagIds``; no legacy fallback).
+  The tag picker reads ``GET /api/tags``, which needs the API key's
+  ``tag.read`` permission.
 
 The browser/panel client never sees the API key. All image fetches go
 through ``GET /plugins/picture_immich/image/<library_id>/<asset_id>``,
@@ -264,6 +268,49 @@ def _list_albums(library: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _list_tags(library: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+    """Return ``(tags, hint)``. ``hint`` is set when the server refused
+    the listing, so the picker can say why it is empty. Tags are
+    hierarchical in Immich; ``value`` is the full ``Parent/Child`` path,
+    which keeps two same-named children of different parents apart."""
+    base = library.get("url", "").rstrip("/")
+    if not base:
+        return [], None
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    if not key:
+        return [], None
+    try:
+        payload = fetch_json(
+            f"{base}/api/tags",
+            headers=_api_headers(key),
+            timeout=HTTP_TIMEOUT_S,
+        )
+    except urllib.error.HTTPError as exc:
+        logger.info(
+            "picture_immich: list_tags failed for %s: HTTP %s",
+            library.get("id"),
+            exc.code,
+        )
+        if exc.code in (401, 403):
+            return [], "API key needs the tag.read permission"
+        return [], None
+    except Exception as exc:
+        logger.info(
+            "picture_immich: list_tags failed for %s: %s", library.get("id"), exc
+        )
+        return [], None
+    if not isinstance(payload, list):
+        return [], None
+    out: list[dict[str, Any]] = []
+    for t in payload:
+        if isinstance(t, dict) and isinstance(t.get("id"), str):
+            out.append(
+                {"id": t["id"], "name": t.get("value") or t.get("name") or t["id"]}
+            )
+    out.sort(key=lambda t: str(t["name"]).casefold())
+    return out, None
+
+
 def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
@@ -367,7 +414,7 @@ def _is_browser_friendly(mime: str | None) -> bool:
 
 
 def _fetch_random_assets(
-    base: str, key: str, album_id: str | None = None
+    base: str, key: str, album_id: str | None = None, tag_id: str | None = None
 ) -> list[dict[str, Any]] | None:
     """Fetch a batch of random assets, tolerant of the Immich API changes.
 
@@ -383,7 +430,14 @@ def _fetch_random_assets(
     ``albumIds`` added when ``album_id`` is given. Fall back to the legacy
     GET (whole-library random, or the album detail's embedded ``assets``)
     for pre-v3 servers. Returns the asset list, or ``None`` when both paths
-    fail (network / auth / an even older server)."""
+    fail (network / auth / an even older server).
+
+    ``tag_id`` adds ``tagIds`` the same way. Like ``albumIds`` it is one of
+    the flat filters Immich v3.2 deprecated in favour of a ``filter``
+    object; the flat form is still accepted and is the only one older
+    servers understand. There is no legacy fallback for tags (the old
+    ``GET /api/assets/random`` can't filter), so a failure returns
+    ``None``."""
     headers = _api_headers(key)
     # ``withExif`` matters: without it Immich omits ``exifInfo`` from
     # search results entirely, and the caption loses its reverse-geocoded
@@ -391,6 +445,8 @@ def _fetch_random_assets(
     body: dict[str, Any] = {"size": 20, "withExif": True}
     if album_id:
         body["albumIds"] = [album_id]
+    if tag_id:
+        body["tagIds"] = [tag_id]
     try:
         payload = _post_json(f"{base}/api/search/random", headers, body, HTTP_TIMEOUT_S)
         if isinstance(payload, list):
@@ -399,6 +455,8 @@ def _fetch_random_assets(
         logger.info(
             "picture_immich: search/random failed, trying legacy endpoint: %s", exc
         )
+    if tag_id:
+        return None
     # Legacy (pre-v3) fallbacks.
     try:
         if album_id:
@@ -481,6 +539,34 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
     }
 
 
+def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | None:
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    if not (base and key and tag_id):
+        return None
+    payload = _fetch_random_assets(base, key, tag_id=tag_id)
+    if not payload:
+        return None
+    pool = [a for a in payload if isinstance(a, dict) and a.get("id")]
+    if not pool:
+        return None
+    random.shuffle(pool)  # noqa: S311  (display-only)
+    if _HEIF_AVAILABLE:
+        chosen = pool[0]
+    else:
+        chosen = next(
+            (a for a in pool if _is_browser_friendly(a.get("originalMimeType"))),
+            pool[0],
+        )
+    return {
+        "asset_id": chosen.get("id"),
+        "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
+        "memory_year": None,
+        "mime": chosen.get("originalMimeType"),
+        "location": _location_of(chosen),
+    }
+
+
 # ----- plugin contract ------------------------------------------------
 
 
@@ -515,6 +601,29 @@ def choices(name: str) -> list[dict[str, Any]]:
         if not out:
             return [{"value": "", "label": "No albums; check the library connection."}]
         return out
+    if name == "tags":
+        # Same cross-library collapse and "<tag>, <library>" labels as
+        # albums. A library whose key lacks ``tag.read`` contributes an
+        # empty-value hint row instead of silently contributing nothing.
+        tags_out: list[dict[str, Any]] = []
+        hints: list[dict[str, Any]] = []
+        for lib in _load_libraries(data_dir):
+            lib_name = lib.get("name") or lib["id"]
+            tags, hint = _list_tags(lib)
+            if hint:
+                hints.append({"value": "", "label": f"{hint} ({lib_name})"})
+            for tag in tags:
+                tags_out.append(
+                    {"value": tag["id"], "label": f"{tag['name']}, {lib_name}"}
+                )
+        if not tags_out and not hints:
+            return [
+                {
+                    "value": "",
+                    "label": "No tags; tag photos in Immich, or check the library connection.",
+                }
+            ]
+        return hints + tags_out
     return []
 
 
@@ -536,6 +645,11 @@ def fetch(
         asset = _pick_asset_random(library)
     elif mode == "random_album":
         asset = _pick_asset_album(library, (options.get("album_id") or "").strip())
+    elif mode == "random_tag":
+        tag_id = (options.get("tag_id") or "").strip()
+        if not tag_id:
+            return {"error": "Pick a tag in the cell editor."}
+        asset = _pick_asset_tag(library, tag_id)
     else:
         # ``memory`` (default). Falls back to ``random`` when the
         # library has no memory for today, so the cell still paints
