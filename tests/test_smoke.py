@@ -268,6 +268,7 @@ class _FakeTimeline:
 
     def __init__(self, mimes: dict | None = None) -> None:
         self.mimes = mimes or {}
+        self.bucket_calls: list[str] = []
         self.buckets = {
             "2026-08-01T00:00:00.000Z": {
                 "id": ["mine", "partner-1", "trashed", "video"],
@@ -293,6 +294,7 @@ class _FakeTimeline:
             return [{"timeBucket": tb, "count": len(c["id"])} for tb, c in self.buckets.items()]
         if parsed.path == "/api/timeline/bucket":
             assert query["albumId"] == "album-1"
+            self.bucket_calls.append(query["timeBucket"])
             return self.buckets[query["timeBucket"]]
         if parsed.path.startswith("/api/assets/"):
             asset_id = parsed.path.rsplit("/", 1)[1]
@@ -309,9 +311,40 @@ def test_album_timeline_lists_every_members_images(monkeypatch) -> None:
     # Shared albums: search/random only returns the key owner's assets, so
     # album ids come from the timeline API, which covers every member's.
     server = _load_server()
-    monkeypatch.setattr(server, "fetch_json", _FakeTimeline())
-    ids = server._album_image_ids("http://immich", "key", "album-1")
-    assert sorted(ids) == ["mine", "partner-1", "partner-2"]
+    fake = _FakeTimeline()
+    monkeypatch.setattr(server, "fetch_json", fake)
+    seen: set[str] = set()
+    for _ in range(60):
+        fake.bucket_calls.clear()
+        seen.update(server._album_image_ids("http://immich", "key", "album-1"))
+        # One bucket per render, however many the album has.
+        assert len(fake.bucket_calls) == 1
+    assert seen == {"mine", "partner-1", "partner-2"}
+
+
+def test_album_timeline_weights_buckets_by_count(monkeypatch) -> None:
+    server = _load_server()
+    fake = _FakeTimeline()
+    monkeypatch.setattr(server, "fetch_json", fake)
+    for _ in range(400):
+        server._album_image_ids("http://immich", "key", "album-1")
+    # Counts are 4 and 1, so the August bucket comes up about 80% of the time.
+    august = fake.bucket_calls.count("2026-08-01T00:00:00.000Z") / len(fake.bucket_calls)
+    assert 0.7 < august < 0.9
+
+
+def test_album_timeline_skips_a_bucket_without_images(monkeypatch) -> None:
+    server = _load_server()
+    fake = _FakeTimeline()
+    fake.buckets["2026-06-01T00:00:00.000Z"] = {
+        "id": ["clip"],
+        "isImage": [False],
+        "isTrashed": [False],
+    }
+    monkeypatch.setattr(server, "fetch_json", fake)
+    for _ in range(40):
+        ids = server._album_image_ids("http://immich", "key", "album-1")
+        assert ids and "clip" not in ids
 
 
 def test_album_pick_covers_partner_assets(monkeypatch) -> None:
@@ -334,12 +367,10 @@ def test_album_pick_covers_partner_assets(monkeypatch) -> None:
 def test_album_pick_skips_heic_without_decoder(monkeypatch) -> None:
     server = _load_server()
     monkeypatch.setattr(server, "_HEIF_AVAILABLE", False)
-    monkeypatch.setattr(
-        server, "fetch_json", _FakeTimeline({"mine": "image/heic", "partner-1": "image/heic"})
-    )
-    for _ in range(20):
+    monkeypatch.setattr(server, "fetch_json", _FakeTimeline({"mine": "image/heic"}))
+    for _ in range(40):
         picked = server._pick_asset_album_timeline("http://immich", "key", "album-1")
-        assert picked["asset_id"] == "partner-2"
+        assert picked["asset_id"] in {"partner-1", "partner-2"}
 
 
 def test_album_falls_back_to_search_random_without_timeline(monkeypatch) -> None:

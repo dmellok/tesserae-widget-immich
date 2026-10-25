@@ -453,17 +453,26 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+# Time buckets tried per render before falling back, for an album whose
+# picked bucket holds no images (videos only, say).
+_ALBUM_BUCKET_TRIES = 3
+
+
 def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
-    """Every image id in the album, whoever owns it.
+    """Image ids from one time bucket of the album, whoever owns them.
 
     ``POST /api/search/random`` with ``albumIds`` only returns assets owned
     by the API key's user, so on an album shared with someone else their
     photos never come up. The timeline API is what Immich's own album page
     uses and covers every member's assets: ``GET /api/timeline/buckets``
-    lists the album's time buckets, then ``GET /api/timeline/bucket`` per
-    bucket answers in columns (``id``, ``isImage``, ``isTrashed``, ...).
-    Returns ``None`` when the timeline API is unavailable (e.g. an older
-    server) so the caller can fall back."""
+    lists the album's time buckets with a ``count`` each, and
+    ``GET /api/timeline/bucket`` answers one bucket in columns (``id``,
+    ``isImage``, ``isTrashed``, ...). One bucket is picked weighted by its
+    count, so each asset is about equally likely while a render costs two
+    calls however many years the album spans. A bucket with no images
+    left after skipping videos and trashed assets is swapped for another,
+    up to ``_ALBUM_BUCKET_TRIES``. Returns ``None`` when the timeline API is
+    unavailable (e.g. an older server) so the caller can fall back."""
     headers = _api_headers(key)
     quoted = urllib.parse.quote(album_id, safe="")
     try:
@@ -474,11 +483,21 @@ def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
         )
         if not isinstance(buckets, list):
             return None
-        ids: list[str] = []
+        pool: list[tuple[str, int]] = []
         for bucket in buckets:
             time_bucket = bucket.get("timeBucket") if isinstance(bucket, dict) else None
             if not isinstance(time_bucket, str):
                 continue
+            count = bucket.get("count")
+            if isinstance(count, int) and not isinstance(count, bool):
+                if count > 0:
+                    pool.append((time_bucket, count))
+            else:
+                pool.append((time_bucket, 1))
+        for _ in range(min(_ALBUM_BUCKET_TRIES, len(pool))):
+            weights = [weight for _, weight in pool]
+            index = random.choices(range(len(pool)), weights=weights)[0]  # noqa: S311
+            time_bucket, _weight = pool.pop(index)
             query = urllib.parse.urlencode({"albumId": album_id, "timeBucket": time_bucket})
             cols = fetch_json(
                 f"{base}/api/timeline/bucket?{query}",
@@ -490,15 +509,17 @@ def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
             n = len(cols["id"])
             is_image = cols.get("isImage") or [True] * n
             trashed = cols.get("isTrashed") or [False] * n
-            ids += [
+            ids = [
                 asset_id
                 for asset_id, image, gone in zip(cols["id"], is_image, trashed, strict=False)
                 if isinstance(asset_id, str) and image and not gone
             ]
+            if ids:
+                return ids
     except Exception as exc:
         logger.info("picture_immich: album timeline failed for %s: %s", album_id, exc)
         return None
-    return ids
+    return []
 
 
 def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, Any] | None:
