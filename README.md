@@ -65,6 +65,34 @@ mode), and `tag.read` (tag picker). Without
 `tag.read` the tag picker shows "API key needs the tag.read
 permission" instead of your tags.
 
+## Caption format
+
+With **Caption format** blank the caption is the built-in one (date, place,
+library name). To write your own, fill in a text with `{fields}`:
+
+| Field | Value |
+| --- | --- |
+| `{YYYY}` `{YY}` | year, `2026` / `26` |
+| `{MMMM}` `{MMM}` `{MM}` `{M}` | month, `August` / `Aug` / `08` / `8` |
+| `{DD}` `{D}` | day of the month, `02` / `2` |
+| `{city}` `{state}` `{country}` | place from the photo's GPS, as Immich names it |
+| `{cc}` | the country as an ISO code (`NL`); the full name if it isn't in the table |
+| `{library}` | the library's name |
+| `{memory}` | `3 years ago`, memory mode only |
+
+For example `{D}/{M}/{YYYY} - {city}, {state}, {cc}` gives
+`2/8/2026 - Otterlo, Gelderland, NL`. The date is the day the photo was taken
+where it was taken. Month names are English.
+
+A field with nothing in it is left out, and so is the separator that went with
+it: the text between two fields is printed only between two fields that are
+both shown, using the separator after the last one shown. So without a state
+the example reads `2/8/2026 - Otterlo, NL`, and without a city
+`2/8/2026 - Gelderland, NL`. Text before the first field and after the last
+one is always printed (`({city}, {cc})` gives `(NL)` when only the country
+is known), and a format that shows nothing at all gives no caption. An
+unknown `{word}` is printed as it is.
+
 ## Tested against
 
 - Immich OpenAPI `3.0.0-rc.2` (Immich server `v2.7.x` and the v3

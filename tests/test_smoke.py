@@ -36,6 +36,7 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
         "tag_id",
         "scale",
         "show_caption",
+        "caption_format",
     }
     library_opt = next(o for o in manifest["cell_options"] if o["name"] == "library_id")
     assert library_opt["choices_from"] == "libraries"
@@ -413,3 +414,86 @@ def test_album_falls_back_to_search_random_without_timeline(monkeypatch) -> None
     monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
     lib = {"url": "http://immich", "api_key_secret": "key"}
     assert server._pick_asset_album(lib, "album-1")["asset_id"] == "own"
+
+
+# ----- caption_format --------------------------------------------------
+
+_FORMAT = "{D}/{M}/{YYYY} - {city}, {state}, {cc}"
+_PLACE = {"city": "Otterlo", "state": "Gelderland", "country": "The Netherlands", "cc": "NL"}
+
+
+def _caption(fmt: str, **overrides) -> str:
+    server = _load_server()
+    args = {
+        "taken_at": "2026-08-02T23:30:00.000Z",
+        "place": dict(_PLACE),
+        "library_name": "Home",
+        "memory_year": None,
+    }
+    args.update(overrides)
+    return server._format_caption(fmt, server._caption_values(**args))
+
+
+def test_caption_format_fills_every_field() -> None:
+    assert _caption(_FORMAT) == "2/8/2026 - Otterlo, Gelderland, NL"
+    assert _caption("{DD}.{MM}.{YY}") == "02.08.26"
+    assert _caption("{D} {MMMM} {YYYY}, {library}") == "2 August 2026, Home"
+    assert _caption("{MMM} {YYYY} - {country}") == "Aug 2026 - The Netherlands"
+    assert _caption("{memory}: {YYYY}", memory_year=3) == "3 years ago: 2026"
+    assert _caption("{memory}", memory_year=1) == "1 year ago"
+
+
+def test_caption_format_leaves_out_empty_fields_with_their_separator() -> None:
+    def place(**kw):
+        return {k: v for k, v in _PLACE.items() if k not in kw}
+
+    assert _caption(_FORMAT, place=place(state=1)) == "2/8/2026 - Otterlo, NL"
+    assert _caption(_FORMAT, place=place(city=1)) == "2/8/2026 - Gelderland, NL"
+    assert _caption(_FORMAT, place={"city": "Otterlo", "state": "Gelderland"}) == (
+        "2/8/2026 - Otterlo, Gelderland"
+    )
+    assert _caption(_FORMAT, place={"state": "Gelderland"}) == "2/8/2026 - Gelderland"
+    assert _caption(_FORMAT, place=None) == "2/8/2026"
+
+
+def test_caption_format_keeps_text_around_the_fields() -> None:
+    assert _caption("({city}, {cc})") == "(Otterlo, NL)"
+    assert _caption("({city}, {cc})", place={"city": "Otterlo"}) == "(Otterlo)"
+    assert _caption("({city}, {cc})", place={"cc": "NL"}) == "(NL)"
+    assert _caption("({city}, {cc})", place=None) == ""
+    assert _caption("Taken {D}/{M} {nope}") == "Taken 2/8 {nope}"
+
+
+def test_caption_format_without_a_date_still_shows_the_rest() -> None:
+    assert _caption(_FORMAT, taken_at=None) == "Otterlo, Gelderland, NL"
+    assert _caption(_FORMAT, taken_at="not a date") == "Otterlo, Gelderland, NL"
+
+
+def test_place_of_keeps_the_fields_apart() -> None:
+    server = _load_server()
+    exif = {"city": " Lyon ", "state": "", "country": "France"}
+    assert server._place_of({"exifInfo": exif}) == {
+        "city": "Lyon",
+        "country": "France",
+        "cc": "FR",
+    }
+    assert server._place_of({"exifInfo": {"country": "Atlantis"}})["cc"] == "Atlantis"
+    assert server._place_of({"exifInfo": {}}) is None
+    assert server._place_of({}) is None
+
+
+def test_fetch_returns_a_caption_only_when_a_format_is_set(monkeypatch) -> None:
+    server = _load_server()
+    asset = {
+        "asset_id": "a1",
+        "taken_at": "2026-08-02T23:30:00.000Z",
+        "location": "Otterlo, Gelderland, The Netherlands",
+        "place": dict(_PLACE),
+    }
+    monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
+    monkeypatch.setattr(server, "_data_dir", lambda: None)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    base = {"library_id": "lib", "mode": "random"}
+    assert server.fetch(base, {}, ctx={})["caption"] is None
+    out = server.fetch({**base, "caption_format": _FORMAT}, {}, ctx={})
+    assert out["caption"] == "2/8/2026 - Otterlo, Gelderland, NL"

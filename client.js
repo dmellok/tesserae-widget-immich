@@ -22,6 +22,8 @@ function objectFitFor(scale) {
 }
 
 function captionFor(data) {
+  // A caption_format cell option is filled in on the server.
+  if (typeof data.caption === "string") return data.caption;
   const parts = [];
   if (data.memory_year) {
     parts.push(`${data.memory_year} year${data.memory_year === 1 ? "" : "s"} ago`);
