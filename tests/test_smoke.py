@@ -269,6 +269,24 @@ def test_pickers_carry_location(monkeypatch) -> None:
     assert picked["location"] == "Lyon, France"
 
 
+def test_pickers_prefer_local_date_over_utc(monkeypatch) -> None:
+    # An evening photo in UTC+2: fileCreatedAt is already the next day in
+    # UTC, localDateTime is the date the photographer saw.
+    server = _load_server()
+    asset = {
+        "id": "a1",
+        "originalMimeType": "image/jpeg",
+        "fileCreatedAt": "2026-08-22T21:30:00.000Z",
+        "localDateTime": "2026-08-22T23:30:00.000Z",
+    }
+    monkeypatch.setattr(server, "_fetch_random_assets", lambda *a, **k: [asset])
+    monkeypatch.setattr(server, "_unwrap_token", lambda stored: stored)
+    lib = {"url": "http://immich", "api_key_secret": "key"}
+    assert server._pick_asset_random(lib)["taken_at"] == "2026-08-22T23:30:00.000Z"
+    del asset["localDateTime"]
+    assert server._pick_asset_random(lib)["taken_at"] == "2026-08-22T21:30:00.000Z"
+
+
 class _FakeTimeline:
     """Fake Immich for the album timeline path: two time buckets, assets
     owned by two users, one trashed asset and one video to skip."""

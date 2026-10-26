@@ -27,11 +27,14 @@ function captionFor(data) {
     parts.push(`${data.memory_year} year${data.memory_year === 1 ? "" : "s"} ago`);
   }
   if (data.taken_at) {
+    // taken_at is Immich's localDateTime (the wall-clock time where the
+    // photo was taken, tagged as UTC), so format it as UTC or the date
+    // shifts by the renderer's timezone.
     const dt = new Date(data.taken_at);
     if (!Number.isNaN(dt.getTime())) {
       parts.push(
         dt.toLocaleDateString(undefined, {
-          day: "numeric", month: "short", year: "numeric",
+          day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
         }),
       );
     }

@@ -358,7 +358,7 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
         location = _detail_location(base, key, asset["id"])
     return {
         "asset_id": asset["id"],
-        "taken_at": asset.get("fileCreatedAt") or asset.get("localDateTime"),
+        "taken_at": asset.get("localDateTime") or asset.get("fileCreatedAt"),
         "memory_year": chosen.get("memory_year"),
         "location": location,
     }
@@ -504,7 +504,7 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
         asset = preferred[0] if preferred else candidates[0]
     return {
         "asset_id": asset.get("id"),
-        "taken_at": asset.get("fileCreatedAt") or asset.get("localDateTime"),
+        "taken_at": asset.get("localDateTime") or asset.get("fileCreatedAt"),
         "memory_year": None,
         "mime": asset.get("originalMimeType"),
         "location": _location_of(asset),
@@ -611,7 +611,7 @@ def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, 
         return None
     return {
         "asset_id": chosen.get("id"),
-        "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
+        "taken_at": chosen.get("localDateTime") or chosen.get("fileCreatedAt"),
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
@@ -642,7 +642,7 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
         )
     return {
         "asset_id": chosen.get("id"),
-        "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
+        "taken_at": chosen.get("localDateTime") or chosen.get("fileCreatedAt"),
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
@@ -670,7 +670,7 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
         )
     return {
         "asset_id": chosen.get("id"),
-        "taken_at": chosen.get("fileCreatedAt") or chosen.get("localDateTime"),
+        "taken_at": chosen.get("localDateTime") or chosen.get("fileCreatedAt"),
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
