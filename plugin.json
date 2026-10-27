@@ -83,6 +83,13 @@
       "type": "boolean",
       "label": "Show date / location caption",
       "default": true
+    },
+    {
+      "name": "caption_format",
+      "type": "string",
+      "label": "Caption format",
+      "default": "",
+      "help": "Blank = the built-in caption. Fields: {YYYY} {YY} {MMMM} {MMM} {MM} {M} {DD} {D} {city} {state} {country} {cc} {library} {memory}. Empty fields are left out with their separator. Example: {D}/{M}/{YYYY} - {city}, {state}, {cc}"
     }
   ],
   "render": {

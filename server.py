@@ -353,15 +353,132 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
     # join (``selectAll('asset')`` in Immich's memory repository), so
     # the location has to come from the asset-detail endpoint. Skip the
     # extra fetch when exif WAS embedded and simply has no place data.
-    location = _location_of(asset)
-    if location is None and not isinstance(asset.get("exifInfo"), dict):
-        location = _detail_location(base, key, asset["id"])
+    place_from = asset
+    if _location_of(asset) is None and not isinstance(asset.get("exifInfo"), dict):
+        place_from = _detail_asset(base, key, asset["id"]) or asset
     return {
         "asset_id": asset["id"],
         "taken_at": asset.get("localDateTime") or asset.get("fileCreatedAt"),
         "memory_year": chosen.get("memory_year"),
-        "location": location,
+        "location": _location_of(place_from),
+        "place": _place_of(place_from),
     }
+
+
+# Immich reverse-geocodes to English country names; ``{cc}`` in a caption
+# format shows the ISO 3166 alpha-2 code instead, falling back to the name
+# when it isn't listed here.
+_COUNTRY_CODES: dict[str, str] = {
+    "Argentina": "AR", "Australia": "AU", "Austria": "AT", "Belgium": "BE",
+    "Bolivia": "BO", "Brazil": "BR", "Canada": "CA", "Chile": "CL",
+    "China": "CN", "Colombia": "CO", "Croatia": "HR", "Czechia": "CZ",
+    "Denmark": "DK", "France": "FR", "Germany": "DE", "Greece": "GR",
+    "Hong Kong": "HK", "Hungary": "HU", "Iran": "IR", "Ireland": "IE",
+    "Italy": "IT", "Japan": "JP", "Luxembourg": "LU", "Malaysia": "MY",
+    "Mexico": "MX", "Norway": "NO", "Paraguay": "PY", "Peru": "PE",
+    "Poland": "PL", "Portugal": "PT", "Singapore": "SG", "South Korea": "KR",
+    "Spain": "ES", "Sweden": "SE", "Switzerland": "CH", "Thailand": "TH",
+    "The Netherlands": "NL", "Netherlands": "NL",
+    "United Arab Emirates": "AE", "United Kingdom": "GB",
+    "United States": "US", "Uruguay": "UY", "Vatican": "VA",
+}
+
+
+def _place_of(asset: dict[str, Any]) -> dict[str, str] | None:
+    """The same ``exifInfo`` fields ``_location_of`` joins, kept apart (plus
+    the country's ISO code) so a caption format can pick them one by one.
+    Only the non-empty ones are present."""
+    exif = asset.get("exifInfo")
+    if not isinstance(exif, dict):
+        return None
+    place: dict[str, str] = {}
+    for key in ("city", "state", "country"):
+        value = exif.get(key)
+        if isinstance(value, str) and value.strip():
+            place[key] = value.strip()
+    if "country" in place:
+        place["cc"] = _COUNTRY_CODES.get(place["country"], place["country"])
+    return place or None
+
+
+_MONTHS = (
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+)
+_CAPTION_TOKEN = re.compile(r"\{(\w+)\}")
+
+
+def _caption_values(
+    *,
+    taken_at: str | None,
+    place: dict[str, str] | None,
+    library_name: str | None,
+    memory_year: int | None,
+) -> dict[str, str]:
+    """Every ``{token}`` a caption format may use, minus the empty ones.
+    The date's wall-clock fields are used as stored: ``taken_at`` is
+    Immich's ``localDateTime`` (the time where the photo was taken)."""
+    values: dict[str, str] = dict(place or {})
+    if library_name:
+        values["library"] = library_name
+    if memory_year:
+        values["memory"] = f"{memory_year} year{'' if memory_year == 1 else 's'} ago"
+    if isinstance(taken_at, str):
+        try:
+            dt = datetime.fromisoformat(taken_at.replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+        if dt is not None:
+            values.update(
+                {
+                    "YYYY": f"{dt.year:04d}",
+                    "YY": f"{dt.year % 100:02d}",
+                    "MMMM": _MONTHS[dt.month - 1],
+                    "MMM": _MONTHS[dt.month - 1][:3],
+                    "MM": f"{dt.month:02d}",
+                    "M": str(dt.month),
+                    "DD": f"{dt.day:02d}",
+                    "D": str(dt.day),
+                }
+            )
+    return values
+
+
+def _format_caption(fmt: str, values: dict[str, str]) -> str:
+    """Fill ``{token}``s in ``fmt`` from ``values``, leaving out what's empty.
+
+    The text between two tokens is a separator: it is printed only between
+    two tokens that are both shown, using the separator that follows the
+    last one shown (so ``{city}, {state}, {cc}`` without a state reads
+    ``Otterlo, NL``). Text before the first token and after the last one is
+    always printed, unless nothing at all is shown. Unknown ``{words}``
+    stay as literal text."""
+    names: list[str] = []
+    literals: list[str] = []
+    pos = 0
+    for m in _CAPTION_TOKEN.finditer(fmt):
+        if m.group(1) not in _CAPTION_TOKENS:
+            continue
+        literals.append(fmt[pos:m.start()])
+        names.append(m.group(1))
+        pos = m.end()
+    literals.append(fmt[pos:])
+    shown = [i for i, name in enumerate(names) if values.get(name)]
+    if not shown:
+        return ""
+    out = literals[0]
+    for n, i in enumerate(shown):
+        if n:
+            out += literals[shown[n - 1] + 1]
+        out += values[names[i]]
+    return out + literals[-1]
+
+
+# Tokens a caption format understands (documented in the README).
+_CAPTION_TOKENS = frozenset(
+    ("YYYY", "YY", "MMMM", "MMM", "MM", "M", "DD", "D")
+    + ("city", "state", "country", "cc", "library", "memory")
+)
 
 
 def _location_of(asset: dict[str, Any]) -> str | None:
@@ -369,7 +486,7 @@ def _location_of(asset: dict[str, Any]) -> str | None:
     reverse-geocodes GPS tags into city / state / country. Search
     responses only carry ``exifInfo`` when the request asks for it
     (``withExif``); memories responses never do, hence
-    ``_detail_location``."""
+    ``_detail_asset``."""
     exif = asset.get("exifInfo")
     if not isinstance(exif, dict):
         return None
@@ -383,9 +500,9 @@ def _location_of(asset: dict[str, Any]) -> str | None:
     return ", ".join(dict.fromkeys(parts)) or None
 
 
-def _detail_location(base: str, key: str, asset_id: str) -> str | None:
+def _detail_asset(base: str, key: str, asset_id: str) -> dict[str, Any] | None:
     """Fetch ``GET /api/assets/{id}`` (which always loads the exif
-    relation) and extract the place string. One extra round trip, paid
+    relation) so the caller can read the place from it. One extra round trip, paid
     only when the asset payload in hand had no ``exifInfo``."""
     try:
         payload = fetch_json(
@@ -398,7 +515,7 @@ def _detail_location(base: str, key: str, asset_id: str) -> str | None:
             "picture_immich: asset detail fetch failed for %s: %s", asset_id, exc
         )
         return None
-    return _location_of(payload) if isinstance(payload, dict) else None
+    return payload if isinstance(payload, dict) else None
 
 
 def _is_browser_friendly(mime: str | None) -> bool:
@@ -508,6 +625,7 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
         "memory_year": None,
         "mime": asset.get("originalMimeType"),
         "location": _location_of(asset),
+        "place": _place_of(asset),
     }
 
 
@@ -615,6 +733,7 @@ def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, 
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
+        "place": _place_of(chosen),
     }
 
 
@@ -646,6 +765,7 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
+        "place": _place_of(chosen),
     }
 
 
@@ -674,6 +794,7 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
         "memory_year": None,
         "mime": chosen.get("originalMimeType"),
         "location": _location_of(chosen),
+        "place": _place_of(chosen),
     }
 
 
@@ -790,6 +911,20 @@ def fetch(
     # ``url_for`` call there raises "Unable to build URLs outside an
     # active request without 'SERVER_NAME' configured". The route shape
     # is stable inside this plugin, so a hand-built path is safe.
+    caption_format = (options.get("caption_format") or "").strip()
+    caption = (
+        _format_caption(
+            caption_format,
+            _caption_values(
+                taken_at=asset.get("taken_at"),
+                place=asset.get("place"),
+                library_name=library.get("name") or library_id,
+                memory_year=asset.get("memory_year"),
+            ),
+        )
+        if caption_format
+        else None
+    )
     safe_asset = urllib.parse.quote(asset["asset_id"], safe="")
     safe_library = urllib.parse.quote(library_id, safe="")
     return {
@@ -798,6 +933,7 @@ def fetch(
         "taken_at": asset.get("taken_at"),
         "memory_year": asset.get("memory_year"),
         "location": asset.get("location"),
+        "caption": caption,
         "image_url": f"/plugins/picture_immich/image/{safe_library}/{safe_asset}",
         "scale": options.get("scale") or "fit",
         "show_caption": bool(options.get("show_caption", True)),
