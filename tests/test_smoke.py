@@ -497,3 +497,114 @@ def test_fetch_returns_a_caption_only_when_a_format_is_set(monkeypatch) -> None:
     assert server.fetch(base, {}, ctx={})["caption"] is None
     out = server.fetch({**base, "caption_format": _FORMAT}, {}, ctx={})
     assert out["caption"] == "2/8/2026 - Otterlo, Gelderland, NL"
+
+
+def test_fetch_asks_the_proxy_for_the_cell_size(monkeypatch) -> None:
+    server = _load_server()
+    asset = {"asset_id": "a1", "taken_at": None, "location": None, "place": {}}
+    monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
+    monkeypatch.setattr(server, "_data_dir", lambda: None)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    base = {"library_id": "lib", "mode": "random"}
+    assert server.fetch(base, {}, ctx={})["image_url"].endswith("/lib/a1")
+    out = server.fetch(base, {}, ctx={"cell_w": 3840, "cell_h": 2160})
+    assert out["image_url"].endswith("/lib/a1?w=3840&h=2160")
+
+
+def _jpeg(size: tuple[int, int]) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", size, (200, 100, 50)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def _proxy(monkeypatch, server, responses: dict[str, bytes]):
+    flask = pytest.importorskip("flask")
+    import io
+
+    asked: list[str] = []
+
+    class _Resp(io.BytesIO):
+        headers = {"Content-Type": "image/jpeg"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=0):
+        asked.append(req.full_url)
+        for marker, body in responses.items():
+            if marker in req.full_url:
+                return _Resp(body)
+        raise AssertionError(req.full_url)
+
+    monkeypatch.setattr(
+        server, "_by_id", lambda *a: {"url": "http://immich", "api_key_secret": "k"}
+    )
+    monkeypatch.setattr(server, "_data_dir", lambda: None)
+    monkeypatch.setattr(server, "_unwrap_token", lambda v: "key")
+    monkeypatch.setattr(server.urllib.request, "urlopen", fake_urlopen)
+    app = flask.Flask(__name__)
+    app.register_blueprint(server.blueprint(), url_prefix="/plugins/picture_immich")
+    return app.test_client(), asked
+
+
+def _size(data: bytes) -> tuple[int, int]:
+    import io
+
+    from PIL import Image
+
+    return Image.open(io.BytesIO(data)).size
+
+
+def test_a_small_cell_is_served_from_the_preview(monkeypatch) -> None:
+    server = _load_server()
+    client, asked = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": _jpeg((6000, 4000))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?w=800&h=480")
+    assert resp.status_code == 200
+    assert not any("original" in u for u in asked)
+    assert _size(resp.data) == (853, 480)
+
+
+def test_a_4k_cell_reads_the_original_and_covers_it(monkeypatch) -> None:
+    server = _load_server()
+    client, asked = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": _jpeg((6000, 4000))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?w=3840&h=2160")
+    assert asked[-1].endswith("/api/assets/a1/original")
+    assert _size(resp.data) == (3840, 2560)
+
+
+def test_a_small_original_is_never_enlarged(monkeypatch) -> None:
+    server = _load_server()
+    client, _ = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((1200, 800)), "original": _jpeg((1200, 800))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?w=3840&h=2160")
+    assert _size(resp.data) == (1200, 800)
+
+
+def test_without_a_cell_size_the_old_2000px_preview_path_stays(monkeypatch) -> None:
+    server = _load_server()
+    client, asked = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": _jpeg((6000, 4000))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1")
+    assert not any("original" in u for u in asked)
+    assert _size(resp.data) == (2000, 1125)
