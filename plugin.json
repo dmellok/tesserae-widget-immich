@@ -92,6 +92,9 @@
       "help": "Blank = the built-in caption. Fields: {YYYY} {YY} {MMMM} {MMM} {MM} {M} {DD} {D} {city} {state} {country} {cc} {library} {memory}. Empty fields are left out with their separator. Example: {D}/{M}/{YYYY} - {city}, {state}, {cc}"
     }
   ],
+  "lineups": {
+    "draw": true
+  },
   "render": {
     "dither": "floyd-steinberg",
     "full_bleed": true
