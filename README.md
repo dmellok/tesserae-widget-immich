@@ -111,6 +111,14 @@ unknown `{word}` is printed as it is.
   Immich release changes these paths, the widget will fail loudly
   and surface the upstream error on the cell.
 
+## Photo size
+
+Each photo is sized to the cell it is drawn in, so a 4K screen gets a 4K photo
+and an 800 x 480 e-paper tag about 800 px, never the full original. Immich's
+preview (1440 px on the short edge by default) is used when it covers the cell;
+a bigger cell reads the original and scales it down to just cover the cell.
+`/original` needs the `asset.download` permission on the API key.
+
 ## HEIC support
 
 Most iPhone photos arrive as HEIC. The widget transcodes HEIC to

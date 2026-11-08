@@ -81,6 +81,12 @@ except ImportError:
 # softening the image more than the panel itself would.
 PROXY_MAX_EDGE_PX = 2000
 PROXY_JPEG_QUALITY = 88
+# When the cell's size is known the photo is sized to cover it instead: a 4K
+# TV gets a 4K photo, an 800 x 480 tag about 800 px. Immich's preview (1440 px
+# on the short edge by default) is used when it is big enough, otherwise the
+# original. The edge bound only guards against absurd sizes.
+CELL_MAX_EDGE_PX = 8192
+CELL_JPEG_QUALITY = 90
 # Preview cascade. Immich exposes the same ``/api/assets/<id>/thumbnail``
 # endpoint with a ``?size=...`` switch (see Immich OpenAPI spec
 # 3.0.0-rc.2, AssetMediaSize enum: original / fullsize / preview /
@@ -862,7 +868,7 @@ def fetch(
     options: dict[str, Any], settings: dict[str, Any], *, ctx: dict[str, Any]
 ) -> dict[str, Any]:
     """Return a state dict the client renders against."""
-    del settings, ctx
+    del settings
     library_id = (options.get("library_id") or "").strip()
     if not library_id:
         return {"error": "Pick a library in the cell editor."}
@@ -927,6 +933,7 @@ def fetch(
     )
     safe_asset = urllib.parse.quote(asset["asset_id"], safe="")
     safe_library = urllib.parse.quote(library_id, safe="")
+    size_query = _cell_size_query(ctx)
     return {
         "library_name": library.get("name") or library_id,
         "asset_id": asset["asset_id"],
@@ -934,7 +941,7 @@ def fetch(
         "memory_year": asset.get("memory_year"),
         "location": asset.get("location"),
         "caption": caption,
-        "image_url": f"/plugins/picture_immich/image/{safe_library}/{safe_asset}",
+        "image_url": f"/plugins/picture_immich/image/{safe_library}/{safe_asset}{size_query}",
         "scale": options.get("scale") or "fit",
         "show_caption": bool(options.get("show_caption", True)),
         "mode": mode,
@@ -1076,6 +1083,7 @@ def blueprint() -> Blueprint:
         # only fall back to /original + local Pillow transcode when
         # the derivative hasn't been generated yet. Tested against
         # Immich OpenAPI 3.0.0-rc.2.
+        target = _target_size(request.args.get("w"), request.args.get("h"))
         raw_bytes: bytes | None = None
         raw_ct: str | None = None
         for tmpl in (
@@ -1086,9 +1094,18 @@ def blueprint() -> Blueprint:
             req = urllib.request.Request(url, headers=_api_headers(key))
             try:
                 with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as upstream:
-                    raw_bytes = upstream.read()
-                    raw_ct = upstream.headers.get("Content-Type") or "image/jpeg"
+                    candidate = upstream.read()
+                    candidate_ct = upstream.headers.get("Content-Type") or "image/jpeg"
+                if target is not None and tmpl != IMMICH_ORIGINAL and not _covers(candidate, target):
+                    # Too small for this cell: keep it as the fallback and
+                    # read the original instead.
+                    raw_bytes, raw_ct = candidate, candidate_ct
+                    original = _read_original(base, safe_asset, key, asset_id)
+                    if original is not None:
+                        raw_bytes, raw_ct = original
                     break
+                raw_bytes, raw_ct = candidate, candidate_ct
+                break
             except urllib.error.HTTPError as exc:
                 # 404 "Asset media not found" means the derivative
                 # hasn't been generated yet; move to the next rung.
@@ -1114,7 +1131,10 @@ def blueprint() -> Blueprint:
         if raw_bytes is None:
             abort(502)
 
-        body, content_type = _downscale_jpeg(raw_bytes, raw_ct or "image/jpeg")
+        if target is not None:
+            body, content_type = _cover_jpeg(raw_bytes, raw_ct or "image/jpeg", target)
+        else:
+            body, content_type = _downscale_jpeg(raw_bytes, raw_ct or "image/jpeg")
         resp = Response(body, mimetype=content_type)
         # The widget cell already has its own server-side render
         # cache; tell the browser this URL is fresh per request so
@@ -1126,6 +1146,89 @@ def blueprint() -> Blueprint:
 
 
 # ----- proxy helpers --------------------------------------------------
+
+
+def _cell_size_query(ctx: dict[str, Any] | None) -> str:
+    """``?w=&h=`` for the cell being drawn, or "" when the host didn't say."""
+    try:
+        w = int((ctx or {}).get("cell_w") or 0)
+        h = int((ctx or {}).get("cell_h") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if w <= 0 or h <= 0:
+        return ""
+    return f"?w={w}&h={h}"
+
+
+def _target_size(raw_w: str | None, raw_h: str | None) -> tuple[int, int] | None:
+    try:
+        w, h = int(raw_w or 0), int(raw_h or 0)
+    except ValueError:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return min(w, CELL_MAX_EDGE_PX), min(h, CELL_MAX_EDGE_PX)
+
+
+def _cover_scale(size: tuple[int, int], target: tuple[int, int]) -> float:
+    """Scale at which an image of ``size`` just covers ``target``."""
+    return max(target[0] / max(1, size[0]), target[1] / max(1, size[1]))
+
+
+def _covers(raw: bytes, target: tuple[int, int]) -> bool:
+    """Whether the image in ``raw`` is big enough to cover ``target`` (a
+    couple of percent short is fine), judged from its header alone."""
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            size = im.size
+            orientation = im.getexif().get(0x0112)
+    except (UnidentifiedImageError, OSError, ValueError):
+        return True
+    if orientation in (5, 6, 7, 8):
+        size = (size[1], size[0])
+    return _cover_scale(size, target) <= 1.02
+
+
+def _read_original(
+    base: str, safe_asset: str, key: str, asset_id: str
+) -> tuple[bytes, str] | None:
+    url = f"{base}{IMMICH_ORIGINAL.format(asset_id=safe_asset)}"
+    req = urllib.request.Request(url, headers=_api_headers(key))
+    try:
+        with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as upstream:
+            return upstream.read(), upstream.headers.get("Content-Type") or "image/jpeg"
+    except (urllib.error.URLError, OSError) as exc:
+        logger.info("picture_immich: original fetch failed for %s: %s", asset_id, exc)
+        return None
+
+
+def _cover_jpeg(
+    raw: bytes, content_type: str, target: tuple[int, int]
+) -> tuple[bytes, str]:
+    """Like :func:`_downscale_jpeg`, but sized to just cover the cell (never
+    enlarged), so the panel's renderer has every pixel it can show and no
+    more."""
+    try:
+        with Image.open(io.BytesIO(raw)) as im:
+            im = ImageOps.exif_transpose(im) or im
+            scale = _cover_scale(im.size, target)
+            if scale < 1:
+                size = (
+                    max(1, round(im.size[0] * scale)),
+                    max(1, round(im.size[1] * scale)),
+                )
+                im = im.resize(size, Image.Resampling.LANCZOS)
+            if im.mode not in {"RGB", "L"}:
+                im = im.convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=CELL_JPEG_QUALITY, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        logger.info(
+            "picture_immich: Pillow can't decode (%s); passing original bytes through",
+            type(exc).__name__,
+        )
+        return raw, content_type or "application/octet-stream"
 
 
 def _downscale_jpeg(raw: bytes, content_type: str) -> tuple[bytes, str]:
