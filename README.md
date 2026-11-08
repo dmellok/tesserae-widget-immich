@@ -33,6 +33,12 @@ photo comes from `/api/search/random` with `tagIds`. The API key
 needs the `tag.read` permission; without it the picker shows "API key
 needs the tag.read permission" instead of your tags.
 
+## Lineups
+
+The widget declares `"lineups": {"draw": true}`: each render picks its own
+photo, so on the Lineups page the arrows on a step showing this widget draw
+another photo instead of listing items.
+
 ## Install (when published to the catalog)
 
 Open **Settings → Widgets → Browse** in Tesserae and search for
