@@ -30,11 +30,13 @@ which proxies to Immich's preview endpoint with the stored key.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
 import re
 import secrets
+import time
 import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
@@ -81,6 +83,8 @@ except ImportError:
 # softening the image more than the panel itself would.
 PROXY_MAX_EDGE_PX = 2000
 PROXY_JPEG_QUALITY = 88
+# Long edge of a Lineups preview.
+THUMB_MAX_EDGE_PX = 320
 # When the cell's size is known the photo is sized to cover it instead: a 4K
 # TV gets a 4K photo, an 800 x 480 tag about 800 px. Immich's preview (1440 px
 # on the short edge by default) is used when it is big enough, otherwise the
@@ -804,6 +808,389 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
     }
 
 
+# ----- Lineups items --------------------------------------------------
+#
+# The Lineups page and the lineup editor list the photos a cell draws from
+# (``lineup_items``) and can pin the cell to one (``pinned_asset``). The list
+# comes from a small cache in ``data_dir`` so a request never waits on Immich:
+# a missing or stale entry is refreshed with a short time box, and what was
+# fetched so far is kept, so a big album fills in over a few requests.
+
+PIN_OPTION = "pinned_asset"
+LINEUP_FETCH_BUDGET_S = 4.0  # most one request spends on Immich for a listing
+LINEUP_CALL_TIMEOUT_S = 3.0  # one Immich call inside that budget
+LINEUP_MAX_ITEMS = 1000  # a listing keeps at most this many photos
+LINEUP_TTL_S = 3600  # a complete album/tag list is fresh for an hour
+LINEUP_RANDOM_TTL_S = 900  # a random pool for fifteen minutes
+LINEUP_PARTIAL_TTL_S = 15  # an unfinished list is resumed almost at once
+LINEUP_RANDOM_POOL = 24
+LINEUP_FILE_MAX_AGE_S = 3 * 86400
+_ASSET_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
+
+
+def _lineup_data_dir(ctx: dict[str, Any] | None) -> Path:
+    raw = (ctx or {}).get("data_dir")
+    if raw:
+        path = Path(str(raw))
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    return _data_dir()
+
+
+def _lineup_scope(options: dict[str, Any], library_id: str) -> tuple[str, dict[str, str]]:
+    """``(cache key, scope)`` for the photos these options draw from. The
+    scope names the source: ``album``, ``tag``, ``memory`` or ``random``."""
+    mode = (options.get("mode") or "memory").strip()
+    album_id = (options.get("album_id") or "").strip()
+    tag_id = (options.get("tag_id") or "").strip()
+    if mode == "random_album" and album_id:
+        scope = {"source": "album", "id": album_id}
+    elif mode == "random_tag" and tag_id:
+        scope = {"source": "tag", "id": tag_id}
+    elif mode == "memory":
+        scope = {"source": "memory", "id": datetime.now(tz=UTC).date().isoformat()}
+    else:
+        scope = {"source": "random", "id": ""}
+    raw = f"{library_id}|{scope['source']}|{scope['id']}"
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16], scope
+
+
+def _lineup_cache_path(data_dir: Path, key: str) -> Path:
+    return data_dir / f"lineup_{key}.json"
+
+
+def _lineup_read(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("items"), list):
+        return None
+    return raw
+
+
+def _lineup_write(path: Path, entry: dict[str, Any]) -> None:
+    try:
+        tmp = path.with_suffix(f".{secrets.token_hex(3)}.tmp")
+        tmp.write_text(json.dumps(entry), encoding="utf-8")
+        tmp.replace(path)
+        cutoff = time.time() - LINEUP_FILE_MAX_AGE_S
+        for old in path.parent.glob("lineup_*.json"):
+            if old != path and old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.info("picture_immich: lineup cache not written: %s", exc)
+
+
+def _lineup_entry_fresh(entry: dict[str, Any]) -> bool:
+    ttl = (
+        LINEUP_PARTIAL_TTL_S
+        if entry.get("pending")
+        else LINEUP_RANDOM_TTL_S
+        if entry.get("source") == "random"
+        else LINEUP_TTL_S
+    )
+    return time.time() - float(entry.get("ts") or 0) < ttl
+
+
+def _day_of(stamp: Any) -> str:
+    return stamp[:10] if isinstance(stamp, str) and len(stamp) >= 10 else ""
+
+
+def _lineup_item(asset: dict[str, Any]) -> dict[str, str] | None:
+    asset_id = asset.get("id")
+    if not isinstance(asset_id, str) or not _ASSET_ID_RE.match(asset_id):
+        return None
+    name = asset.get("originalFileName")
+    day = _day_of(asset.get("localDateTime") or asset.get("fileCreatedAt"))
+    return {"id": asset_id, "label": str(name or day or asset_id[:8])}
+
+
+def _album_items_step(
+    base: str, key: str, album_id: str, entry: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    """Continue listing an album's images, newest time bucket first, until
+    the deadline. ``entry["pending"]`` holds the buckets still to read."""
+    headers = _api_headers(key)
+    quoted = urllib.parse.quote(album_id, safe="")
+    if entry.get("pending") is None:
+        buckets = fetch_json(
+            f"{base}/api/timeline/buckets?albumId={quoted}",
+            headers=headers,
+            timeout=_call_timeout(deadline),
+        )
+        if not isinstance(buckets, list):
+            raise ValueError("no timeline")
+        pending = [
+            b["timeBucket"]
+            for b in buckets
+            if isinstance(b, dict)
+            and isinstance(b.get("timeBucket"), str)
+            and not (isinstance(b.get("count"), int) and b["count"] <= 0)
+        ]
+        entry["pending"] = pending
+        entry["total"] = sum(
+            b["count"]
+            for b in buckets
+            if isinstance(b, dict)
+            and isinstance(b.get("count"), int)
+            and not isinstance(b.get("count"), bool)
+        )
+    items: list[dict[str, str]] = entry["items"]
+    pending: list[str] = entry["pending"]
+    while pending and len(items) < LINEUP_MAX_ITEMS and time.monotonic() < deadline:
+        query = urllib.parse.urlencode({"albumId": album_id, "timeBucket": pending[0]})
+        cols = fetch_json(
+            f"{base}/api/timeline/bucket?{query}",
+            headers=headers,
+            timeout=_call_timeout(deadline),
+        )
+        pending.pop(0)
+        if not isinstance(cols, dict) or not isinstance(cols.get("id"), list):
+            continue
+        n = len(cols["id"])
+        is_image = cols.get("isImage") or [True] * n
+        trashed = cols.get("isTrashed") or [False] * n
+        created = cols.get("fileCreatedAt") or [""] * n
+        for asset_id, image, gone, when in zip(
+            cols["id"], is_image, trashed, created, strict=False
+        ):
+            if image and not gone:
+                item = _lineup_item({"id": asset_id, "fileCreatedAt": when})
+                if item:
+                    items.append(item)
+    if len(items) >= LINEUP_MAX_ITEMS and (pending or len(items) > LINEUP_MAX_ITEMS):
+        del items[LINEUP_MAX_ITEMS:]
+        pending.clear()
+        entry["capped"] = True
+    elif not pending:
+        # Every bucket read: the buckets' own count includes videos.
+        entry["total"] = len(items)
+    return entry
+
+
+def _call_timeout(deadline: float) -> float:
+    return max(0.5, min(LINEUP_CALL_TIMEOUT_S, deadline - time.monotonic()))
+
+
+def _tag_items_step(
+    base: str, key: str, tag_id: str, entry: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    """List images carrying a tag, a page of 250 at a time, until the deadline."""
+    items: list[dict[str, str]] = entry["items"]
+    page = int(entry.get("next_page") or 1)
+    while page and len(items) < LINEUP_MAX_ITEMS and time.monotonic() < deadline:
+        body = {"tagIds": [tag_id], "type": "IMAGE", "size": 250, "page": page}
+        payload = _post_json(
+            f"{base}/api/search/metadata",
+            _api_headers(key),
+            body,
+            _call_timeout(deadline),
+        )
+        block = payload.get("assets") if isinstance(payload, dict) else None
+        if not isinstance(block, dict):
+            raise ValueError("no search result")
+        for asset in block.get("items") or []:
+            item = _lineup_item(asset) if isinstance(asset, dict) else None
+            if item:
+                items.append(item)
+        total = block.get("total")
+        if isinstance(total, int) and not isinstance(total, bool):
+            entry["total"] = total
+        nxt = block.get("nextPage")
+        page = int(nxt) if isinstance(nxt, (str, int)) and str(nxt).isdigit() else 0
+    entry["next_page"] = page
+    entry["pending"] = [str(page)] if page and len(items) < LINEUP_MAX_ITEMS else []
+    if len(items) >= LINEUP_MAX_ITEMS:
+        del items[LINEUP_MAX_ITEMS:]
+        entry["pending"] = []
+    return entry
+
+
+def _memory_items(base: str, key: str, deadline: float) -> list[dict[str, str]]:
+    today = datetime.now(tz=UTC).date().isoformat()
+    payload = fetch_json(
+        f"{base}/api/memories?for={today}",
+        headers=_api_headers(key),
+        timeout=_call_timeout(deadline),
+    )
+    items: list[dict[str, str]] = []
+    for memory in payload if isinstance(payload, list) else []:
+        for asset in (memory.get("assets") if isinstance(memory, dict) else None) or []:
+            item = _lineup_item(asset) if isinstance(asset, dict) else None
+            if item and asset.get("type", "IMAGE") == "IMAGE":
+                items.append(item)
+    return items[:LINEUP_MAX_ITEMS]
+
+
+def _random_items(
+    base: str, key: str, deadline: float, album_id: str | None = None, tag_id: str | None = None
+) -> list[dict[str, str]]:
+    body: dict[str, Any] = {"size": LINEUP_RANDOM_POOL, "type": "IMAGE"}
+    if album_id:
+        body["albumIds"] = [album_id]
+    if tag_id:
+        body["tagIds"] = [tag_id]
+    payload = _post_json(
+        f"{base}/api/search/random", _api_headers(key), body, _call_timeout(deadline)
+    )
+    items = [_lineup_item(a) for a in payload if isinstance(a, dict)] if isinstance(payload, list) else []
+    return [i for i in items if i]
+
+
+def _lineup_listing(
+    options: dict[str, Any], ctx: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The cached (or time-boxed refreshed) listing for these options:
+    ``{"items": [{id, label}], "total": int, "library": id, ...}``, or None
+    when the cell has no usable library."""
+    library_id = (options.get("library_id") or "").strip()
+    if not library_id or not _LIBRARY_ID_RE.match(library_id):
+        return None
+    data_dir = _lineup_data_dir(ctx)
+    library = _by_id(data_dir, library_id)
+    if library is None:
+        return None
+    key_id, scope = _lineup_scope(options, library_id)
+    path = _lineup_cache_path(data_dir, key_id)
+    entry = _lineup_read(path)
+    if entry is not None and _lineup_entry_fresh(entry):
+        return {**entry, "library": library_id}
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    if not (base and key):
+        return None
+    deadline = time.monotonic() + LINEUP_FETCH_BUDGET_S
+    # A stale entry is resumed (an unfinished album) or kept as the answer
+    # when Immich is slow or down; a complete stale one is read afresh.
+    working: dict[str, Any] = (
+        entry
+        if entry is not None and entry.get("pending")
+        else {"items": [], "pending": None, "total": 0}
+    )
+    working["source"] = scope["source"]
+    try:
+        if scope["source"] == "album":
+            working = _album_items_step(base, key, scope["id"], working, deadline)
+        elif scope["source"] == "tag":
+            if working.get("pending") is None:
+                working["pending"] = []
+            working = _tag_items_step(base, key, scope["id"], working, deadline)
+        elif scope["source"] == "memory":
+            working["items"] = _memory_items(base, key, deadline)
+            working["pending"] = []
+            working["total"] = len(working["items"])
+        if scope["source"] == "random" or (
+            scope["source"] == "memory" and not working["items"]
+        ):
+            # Today's memory is empty, so ``fetch`` falls back to a random photo.
+            working["source"] = "random"
+            working["items"] = _random_items(base, key, deadline)
+            working["pending"] = []
+            working["total"] = _library_total(base, key, deadline) or len(working["items"])
+    except Exception as exc:
+        logger.info("picture_immich: lineup listing failed (%s): %s", scope["source"], exc)
+        if entry is not None:
+            return {**entry, "library": library_id}
+        if not working["items"]:
+            # No timeline / search API (an old server): list a random pool.
+            try:
+                working["items"] = _random_items(
+                    base,
+                    key,
+                    time.monotonic() + LINEUP_CALL_TIMEOUT_S,
+                    album_id=scope["id"] if scope["source"] == "album" else None,
+                    tag_id=scope["id"] if scope["source"] == "tag" else None,
+                )
+            except Exception:
+                working["items"] = []
+            working["pending"] = []
+            working["total"] = len(working["items"])
+            if not working["items"]:
+                return {"items": [], "total": 0, "pending": [], "library": library_id}
+    if not working.get("total"):
+        working["total"] = len(working["items"])
+    working["ts"] = time.time()
+    _lineup_write(path, working)
+    return {**working, "library": library_id}
+
+
+def _library_total(base: str, key: str, deadline: float) -> int:
+    """Images in the whole library (``GET /api/assets/statistics``), or 0."""
+    try:
+        stats = fetch_json(
+            f"{base}/api/assets/statistics",
+            headers=_api_headers(key),
+            timeout=_call_timeout(deadline),
+        )
+    except Exception:
+        return 0
+    n = stats.get("images") if isinstance(stats, dict) else None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n > 0 else 0
+
+
+def lineup_items(
+    options: dict[str, Any], *, ctx: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
+    """The photos this cell draws from, for the Lineups arrows and the lineup
+    editor: ``[{"key": asset id, "label", "thumb"}]``. An album, a tag and
+    today's memory are listed in full (an album or tag stops at
+    ``LINEUP_MAX_ITEMS``); a random library lists the pool of random photos
+    last drawn. Read from a cache, with at most ``LINEUP_FETCH_BUDGET_S`` spent
+    on Immich to fill it."""
+    listing = _lineup_listing(options, ctx)
+    if listing is None:
+        return []
+    safe_library = urllib.parse.quote(listing["library"], safe="")
+    return [
+        {
+            "key": item["id"],
+            "label": item["label"],
+            "thumb": (
+                f"/plugins/picture_immich/image/{safe_library}/"
+                f"{urllib.parse.quote(item['id'], safe='')}?thumb=1"
+            ),
+        }
+        for item in listing["items"]
+        if isinstance(item, dict) and item.get("id")
+    ]
+
+
+def lineup_item_count(
+    options: dict[str, Any], *, ctx: dict[str, Any] | None = None
+) -> int | None:
+    """How many photos the cell draws from (an album's or tag's real count;
+    the library's image total for a random cell), or None when unknown."""
+    listing = _lineup_listing(options, ctx)
+    if listing is None:
+        return None
+    total = listing.get("total")
+    n = max(len(listing["items"]), total if isinstance(total, int) else 0)
+    return n or None
+
+
+def _pinned_asset(library: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
+    """The photo a cell is pinned to, from its detail record (date, place and
+    type in one call), or None when it is gone or not a usable image."""
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    if not (base and key and _ASSET_ID_RE.match(asset_id)):
+        return None
+    asset = _detail_asset(base, key, asset_id)
+    if not asset or asset.get("id") != asset_id or asset.get("isTrashed"):
+        return None
+    if str(asset.get("type") or "IMAGE").upper() != "IMAGE":
+        return None
+    return {
+        "asset_id": asset_id,
+        "taken_at": asset.get("localDateTime") or asset.get("fileCreatedAt"),
+        "memory_year": None,
+        "mime": asset.get("originalMimeType"),
+        "location": _location_of(asset),
+        "place": _place_of(asset),
+    }
+
+
 # ----- plugin contract ------------------------------------------------
 
 
@@ -877,8 +1264,15 @@ def fetch(
         return {"error": f"Library {library_id!r} no longer exists."}
 
     mode = (options.get("mode") or "memory").strip()
-    asset: dict[str, Any] | None
-    if mode == "random":
+    asset: dict[str, Any] | None = None
+    # A cell pinned from Lineups shows that photo and nothing else: no pick,
+    # no history. A photo that is gone falls back to the cell's own mode.
+    pinned = str(options.get(PIN_OPTION) or "").strip()
+    if pinned:
+        asset = _pinned_asset(library, pinned)
+    if asset is not None:
+        pass  # pinned: nothing to pick
+    elif mode == "random":
         asset = _pick_asset_random(library)
     elif mode == "random_album":
         asset = _pick_asset_album(library, (options.get("album_id") or "").strip())
@@ -1084,10 +1478,20 @@ def blueprint() -> Blueprint:
         # the derivative hasn't been generated yet. Tested against
         # Immich OpenAPI 3.0.0-rc.2.
         target = _target_size(request.args.get("w"), request.args.get("h"))
+        # ``?thumb=1`` (the Lineups previews): Immich's small thumbnail first,
+        # never read just to be scaled up, and cacheable by the browser.
+        thumb = request.args.get("thumb") == "1"
+        cascade = (
+            ("/api/assets/{asset_id}/thumbnail?size=thumbnail", IMMICH_THUMB_CASCADE[0])
+            if thumb
+            else IMMICH_THUMB_CASCADE
+        )
+        if thumb:
+            target = None
         raw_bytes: bytes | None = None
         raw_ct: str | None = None
         for tmpl in (
-            *IMMICH_THUMB_CASCADE,
+            *cascade,
             IMMICH_ORIGINAL,
         ):
             url = f"{base}{tmpl.format(asset_id=safe_asset)}"
@@ -1133,9 +1537,16 @@ def blueprint() -> Blueprint:
 
         if target is not None:
             body, content_type = _cover_jpeg(raw_bytes, raw_ct or "image/jpeg", target)
+        elif thumb:
+            body, content_type = _downscale_jpeg(
+                raw_bytes, raw_ct or "image/jpeg", edge=THUMB_MAX_EDGE_PX
+            )
         else:
             body, content_type = _downscale_jpeg(raw_bytes, raw_ct or "image/jpeg")
         resp = Response(body, mimetype=content_type)
+        if thumb:
+            resp.headers["Cache-Control"] = "private, max-age=3600"
+            return resp
         # The widget cell already has its own server-side render
         # cache; tell the browser this URL is fresh per request so
         # we don't have to bust query strings on update.
@@ -1231,7 +1642,9 @@ def _cover_jpeg(
         return raw, content_type or "application/octet-stream"
 
 
-def _downscale_jpeg(raw: bytes, content_type: str) -> tuple[bytes, str]:
+def _downscale_jpeg(
+    raw: bytes, content_type: str, edge: int = PROXY_MAX_EDGE_PX
+) -> tuple[bytes, str]:
     """Open with Pillow, resize the long edge down to ``PROXY_MAX_EDGE_PX``,
     re-encode as JPEG. On any decode failure (HEIC without pillow-heif
     installed, exotic formats, truncated bytes), pass the bytes
@@ -1239,9 +1652,7 @@ def _downscale_jpeg(raw: bytes, content_type: str) -> tuple[bytes, str]:
     try:
         with Image.open(io.BytesIO(raw)) as im:
             im = ImageOps.exif_transpose(im) or im
-            im.thumbnail(
-                (PROXY_MAX_EDGE_PX, PROXY_MAX_EDGE_PX), Image.Resampling.LANCZOS
-            )
+            im.thumbnail((edge, edge), Image.Resampling.LANCZOS)
             if im.mode not in {"RGB", "L"}:
                 im = im.convert("RGB")
             buf = io.BytesIO()

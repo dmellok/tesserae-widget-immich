@@ -90,9 +90,19 @@
       "label": "Caption format",
       "default": "",
       "help": "Blank = the built-in caption. Fields: {YYYY} {YY} {MMMM} {MMM} {MM} {M} {DD} {D} {city} {state} {country} {cc} {library} {memory}. Empty fields are left out with their separator. Example: {D}/{M}/{YYYY} - {city}, {state}, {cc}"
+    },
+    {
+      "name": "pinned_asset",
+      "type": "string",
+      "label": "Pinned photo",
+      "default": "",
+      "advanced": true,
+      "help": "Set from Lineups (Show chosen): this photo is shown instead of the mode's pick. Clear it to go back to the mode."
     }
   ],
   "lineups": {
+    "pin_option": "pinned_asset",
+    "noun": "photos",
     "draw": true
   },
   "render": {

@@ -35,9 +35,23 @@ needs the tag.read permission" instead of your tags.
 
 ## Lineups
 
-The widget declares `"lineups": {"draw": true}`: each render picks its own
-photo, so on the Lineups page the arrows on a step showing this widget draw
-another photo instead of listing items.
+On the Lineups page and in the lineup editor, a step showing this widget lists
+the photos it draws from, with previews and the real count: the chosen album's
+images (every member's, newest first), the photos carrying the chosen tag, or
+today's memory. A random library (and a memory day with no memories) lists a
+pool of random photos and the library's image total. **Show chosen** pins the
+cell to one photo (the `pinned_asset` option, shown under Advanced); clear it to
+go back to the mode. A pinned cell shows exactly that photo and picks nothing.
+
+Listings are read from a small cache in the widget's data folder (an hour for
+albums and tags, fifteen minutes for a random pool) and refilled with a
+four-second limit on Immich, so a big album fills in over a few visits and a
+slow or unreachable server never stalls the page. Lists stop at 1000 photos.
+Previews come from Immich's small thumbnail through the widget's image route
+(`?thumb=1`).
+
+The widget still declares `"draw": true` for a random library; the host uses it
+once the cell has no list to offer.
 
 ## Install (when published to the catalog)
 

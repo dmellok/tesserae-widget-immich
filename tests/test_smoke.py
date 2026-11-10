@@ -37,13 +37,14 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
         "scale",
         "show_caption",
         "caption_format",
+        "pinned_asset",
     }
     library_opt = next(o for o in manifest["cell_options"] if o["name"] == "library_id")
     assert library_opt["choices_from"] == "libraries"
     album_opt = next(o for o in manifest["cell_options"] if o["name"] == "album_id")
     assert album_opt["choices_from"] == "albums"
     # Every render picks its own photo, so the Lineups arrows draw another.
-    assert manifest["lineups"] == {"draw": True}
+    assert manifest["lineups"] == {"pin_option": "pinned_asset", "noun": "photos", "draw": True}
 
 
 def test_server_module_exposes_plugin_contract() -> None:
