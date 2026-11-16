@@ -35,6 +35,7 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
         "album_id",
         "tag_id",
         "scale",
+        "resolution",
         "show_caption",
         "caption_format",
         "pinned_asset",
@@ -611,3 +612,89 @@ def test_without_a_cell_size_the_old_2000px_preview_path_stays(monkeypatch) -> N
     resp = client.get("/plugins/picture_immich/image/lib/a1")
     assert not any("original" in u for u in asked)
     assert _size(resp.data) == (2000, 1125)
+
+
+def test_resolution_defaults_to_standard() -> None:
+    manifest = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
+    resolution = next(o for o in manifest["cell_options"] if o["name"] == "resolution")
+    assert resolution["default"] == "standard"
+    assert {c["value"] for c in resolution["choices"]} == {"standard", "full"}
+
+
+@pytest.mark.parametrize(
+    "ctx,query",
+    [({}, "?full=1"), ({"cell_w": 3840, "cell_h": 2160}, "?w=3840&h=2160&full=1")],
+)
+def test_full_resolution_keeps_the_cell_size_in_the_url(
+    monkeypatch, ctx, query
+) -> None:
+    server = _load_server()
+    asset: dict = {"asset_id": "a1", "taken_at": None, "location": None, "place": {}}
+    monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
+    monkeypatch.setattr(server, "_data_dir", lambda: None)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    out = server.fetch(
+        {"library_id": "lib", "mode": "random", "resolution": "full"}, {}, ctx=ctx
+    )
+    assert out["image_url"].endswith("/lib/a1" + query)
+
+
+@pytest.mark.parametrize(
+    "query,size", [("", (3840, 2560)), ("&w=800&h=480", (800, 533))]
+)
+def test_full_resolution_reads_the_original_first(monkeypatch, query, size) -> None:
+    server = _load_server()
+    client, asked = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": _jpeg((6000, 4000))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1" + query)
+    assert resp.status_code == 200
+    assert asked == ["http://immich/api/assets/a1/original"]
+    assert _size(resp.data) == size
+
+
+@pytest.mark.parametrize("failure", [403, 404, "offline"])
+def test_full_resolution_falls_back_to_preview(monkeypatch, failure) -> None:
+    import urllib.error
+
+    server = _load_server()
+    client, asked = _proxy(monkeypatch, server, {"size=preview": _jpeg((2560, 1440))})
+    open_preview = server.urllib.request.urlopen
+
+    def urlopen(req, timeout=0):
+        if req.full_url.endswith("/original"):
+            asked.append(req.full_url)
+            if failure == "offline":
+                raise urllib.error.URLError("offline")
+            raise urllib.error.HTTPError(req.full_url, failure, "unavailable", {}, None)
+        return open_preview(req, timeout=timeout)
+
+    monkeypatch.setattr(server.urllib.request, "urlopen", urlopen)
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1&w=3840&h=2160")
+    assert resp.status_code == 200
+    assert asked == [
+        "http://immich/api/assets/a1/original",
+        "http://immich/api/assets/a1/thumbnail?size=preview",
+    ]
+    assert _size(resp.data) == (2560, 1440)
+
+
+def test_full_resolution_never_enlarges_a_small_original(monkeypatch) -> None:
+    server = _load_server()
+    client, _ = _proxy(monkeypatch, server, {"original": _jpeg((1200, 800))})
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1")
+    assert _size(resp.data) == (1200, 800)
+
+
+def test_lineup_thumbnails_ignore_full_resolution(monkeypatch) -> None:
+    server = _load_server()
+    client, asked = _proxy(monkeypatch, server, {"size=thumbnail": _jpeg((800, 600))})
+    resp = client.get(
+        "/plugins/picture_immich/image/lib/a1?thumb=1&full=1&w=3840&h=2160"
+    )
+    assert resp.status_code == 200
+    assert asked == ["http://immich/api/assets/a1/thumbnail?size=thumbnail"]
+    assert _size(resp.data) == (320, 240)
+    assert resp.headers["Cache-Control"] == "private, max-age=3600"
