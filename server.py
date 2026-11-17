@@ -38,6 +38,7 @@ import re
 import secrets
 import time
 import urllib.parse
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,9 @@ PROXY_JPEG_QUALITY = 88
 # Full resolution reads the original first, with a 4K fallback size for hosts
 # that do not pass the cell dimensions.
 PROXY_FULL_MAX_EDGE_PX = 3840
+# Full resolution reads the original first. Past this it is left alone and a
+# preview is shown: the whole file is held in memory to be resized.
+FULL_ORIGINAL_MAX_BYTES = 64 * 1024 * 1024
 PROXY_FULL_JPEG_QUALITY = 92
 # Long edge of a Lineups preview.
 THUMB_MAX_EDGE_PX = 320
@@ -1500,8 +1504,13 @@ def blueprint() -> Blueprint:
         raw_ct: str | None = None
         for tmpl in cascade:
             if full and tmpl == IMMICH_ORIGINAL:
-                original = _read_original(base, safe_asset, key, asset_id)
-                if original is not None:
+                # An original this host can't draw (a RAW file, one past
+                # Pillow's pixel limit) or one too big to hold in memory is
+                # skipped, and the previews below are tried as in Standard.
+                original = _read_original(
+                    base, safe_asset, key, asset_id, max_bytes=FULL_ORIGINAL_MAX_BYTES
+                )
+                if original is not None and _decodable(original[0]):
                     raw_bytes, raw_ct = original
                     break
                 continue
@@ -1521,7 +1530,7 @@ def blueprint() -> Blueprint:
                     # read the original instead.
                     raw_bytes, raw_ct = candidate, candidate_ct
                     original = _read_original(base, safe_asset, key, asset_id)
-                    if original is not None:
+                    if original is not None and _decodable(original[0]):
                         raw_bytes, raw_ct = original
                     break
                 raw_bytes, raw_ct = candidate, candidate_ct
@@ -1623,14 +1632,47 @@ def _covers(raw: bytes, target: tuple[int, int]) -> bool:
     return _cover_scale(size, target) <= 1.02
 
 
+def _decodable(raw: bytes) -> bool:
+    """Whether Pillow can open ``raw`` at all, judged from its header: False
+    for a format it doesn't know (most RAW files) and for an image past its
+    pixel limit, which it refuses as a decompression bomb."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as im:
+                return im.size[0] > 0 and im.size[1] > 0
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        return False
+
+
 def _read_original(
-    base: str, safe_asset: str, key: str, asset_id: str
+    base: str, safe_asset: str, key: str, asset_id: str, *, max_bytes: int | None = None
 ) -> tuple[bytes, str] | None:
+    """The asset's original file, or None when it can't be read. With
+    ``max_bytes``, None too for a file larger than that, without holding
+    more than ``max_bytes`` of it."""
     url = f"{base}{IMMICH_ORIGINAL.format(asset_id=safe_asset)}"
     req = urllib.request.Request(url, headers=_api_headers(key))
     try:
         with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as upstream:
-            return upstream.read(), upstream.headers.get("Content-Type") or "image/jpeg"
+            content_type = upstream.headers.get("Content-Type") or "image/jpeg"
+            if max_bytes is None:
+                return upstream.read(), content_type
+            declared = upstream.headers.get("Content-Length") or ""
+            if declared.isdigit() and int(declared) > max_bytes:
+                logger.info("picture_immich: original of %s is over the size limit", asset_id)
+                return None
+            body = upstream.read(max_bytes + 1)
+            if len(body) > max_bytes:
+                logger.info("picture_immich: original of %s is over the size limit", asset_id)
+                return None
+            return body, content_type
     except (urllib.error.URLError, OSError) as exc:
         logger.info("picture_immich: original fetch failed for %s: %s", asset_id, exc)
         return None

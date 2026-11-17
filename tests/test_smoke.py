@@ -698,3 +698,57 @@ def test_lineup_thumbnails_ignore_full_resolution(monkeypatch) -> None:
     assert asked == ["http://immich/api/assets/a1/thumbnail?size=thumbnail"]
     assert _size(resp.data) == (320, 240)
     assert resp.headers["Cache-Control"] == "private, max-age=3600"
+
+
+def test_full_resolution_skips_an_original_it_cannot_draw(monkeypatch) -> None:
+    """A RAW original is not an image Pillow can open: Full shows the preview,
+    as Standard does, instead of handing the raw bytes to the cell."""
+    import io
+
+    from PIL import Image
+
+    server = _load_server()
+    raw = b"II*\x00not-an-image-raw-sensor-data" * 50
+    client, asked = _proxy(
+        monkeypatch, server, {"size=preview": _jpeg((2560, 1440)), "original": raw}
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1&w=1920&h=1080")
+    assert resp.status_code == 200
+    assert asked[0].endswith("/original") and "size=preview" in asked[1]
+    assert Image.open(io.BytesIO(resp.data)).size == (1920, 1080)
+
+
+def test_full_resolution_skips_an_original_past_the_pixel_limit(monkeypatch) -> None:
+    import io
+
+    from PIL import Image
+
+    server = _load_server()
+    huge = io.BytesIO()
+    Image.new("L", (16000, 12000)).save(huge, "PNG")
+    client, _ = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": huge.getvalue()},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1&w=1920&h=1080")
+    assert resp.status_code == 200
+    assert Image.open(io.BytesIO(resp.data)).size == (1920, 1080)
+
+
+def test_full_resolution_skips_an_original_over_the_size_limit(monkeypatch) -> None:
+    import io
+
+    from PIL import Image
+
+    server = _load_server()
+    monkeypatch.setattr(server, "FULL_ORIGINAL_MAX_BYTES", 1000)
+    client, asked = _proxy(
+        monkeypatch,
+        server,
+        {"size=preview": _jpeg((2560, 1440)), "original": _jpeg((4000, 3000))},
+    )
+    resp = client.get("/plugins/picture_immich/image/lib/a1?full=1&w=1920&h=1080")
+    assert resp.status_code == 200
+    assert "size=preview" in asked[-1]
+    assert Image.open(io.BytesIO(resp.data)).size == (1920, 1080)
