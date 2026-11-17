@@ -47,14 +47,16 @@
     {
       "name": "album_id",
       "type": "select",
-      "label": "Album (random_album only)",
+      "label": "Album",
+      "show_if": {"mode": "random_album"},
       "default": "",
       "choices_from": "albums"
     },
     {
       "name": "tag_id",
       "type": "select",
-      "label": "Tag (random_tag only)",
+      "label": "Tag",
+      "show_if": {"mode": "random_tag"},
       "default": "",
       "choices_from": "tags"
     },
@@ -97,10 +99,12 @@
     },
     {
       "name": "caption_format",
+      "show_if": {"show_caption": true},
+      "placeholder": "{D}/{M}/{YYYY} - {city}, {state}, {cc}",
       "type": "string",
       "label": "Caption format",
       "default": "",
-      "help": "Blank = the built-in caption. Fields: {YYYY} {YY} {MMMM} {MMM} {MM} {M} {DD} {D} {city} {state} {country} {cc} {library} {memory}. Empty fields are left out with their separator. Example: {D}/{M}/{YYYY} - {city}, {state}, {cc}"
+      "help": "Plain text with brace-delimited fields; spaces and punctuation are kept. Field names are case-sensitive: {YYYY} {YY} {MMMM} {MMM} {MM} {M} {DD} {D} {city} {state} {country} {cc} {library} {memory}. Empty fields are left out with their separator. Leave blank for the built-in caption."
     },
     {
       "name": "pinned_asset",

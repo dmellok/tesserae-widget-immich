@@ -44,8 +44,24 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
     assert library_opt["choices_from"] == "libraries"
     album_opt = next(o for o in manifest["cell_options"] if o["name"] == "album_id")
     assert album_opt["choices_from"] == "albums"
+    assert album_opt["show_if"] == {"mode": "random_album"}
+    tag_opt = next(o for o in manifest["cell_options"] if o["name"] == "tag_id")
+    assert tag_opt["show_if"] == {"mode": "random_tag"}
+    caption_opt = next(o for o in manifest["cell_options"] if o["name"] == "caption_format")
+    assert caption_opt["show_if"] == {"show_caption": True}
     # Every render picks its own photo, so the Lineups arrows draw another.
     assert manifest["lineups"] == {"pin_option": "pinned_asset", "noun": "photos", "draw": True}
+
+
+@pytest.mark.parametrize("name", ["libraries", "albums", "tags"])
+def test_empty_choices_are_editor_guidance(name, monkeypatch, tmp_path) -> None:
+    server = _load_server()
+    monkeypatch.setattr(server, "_data_dir", lambda: tmp_path)
+    rows = server.choices(name)
+    assert len(rows) == 1
+    assert rows[0]["value"] == ""
+    assert rows[0]["label"]
+    assert rows[0].get("note") is True
 
 
 def test_server_module_exposes_plugin_contract() -> None:
