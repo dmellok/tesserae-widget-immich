@@ -38,6 +38,7 @@ import re
 import secrets
 import time
 import urllib.parse
+import warnings
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,13 @@ except ImportError:
 # softening the image more than the panel itself would.
 PROXY_MAX_EDGE_PX = 2000
 PROXY_JPEG_QUALITY = 88
+# Full resolution reads the original first, with a 4K fallback size for hosts
+# that do not pass the cell dimensions.
+PROXY_FULL_MAX_EDGE_PX = 3840
+# Full resolution reads the original first. Past this it is left alone and a
+# preview is shown: the whole file is held in memory to be resized.
+FULL_ORIGINAL_MAX_BYTES = 64 * 1024 * 1024
+PROXY_FULL_JPEG_QUALITY = 92
 # Long edge of a Lineups preview.
 THUMB_MAX_EDGE_PX = 320
 # When the cell's size is known the photo is sized to cover it instead: a 4K
@@ -1329,6 +1337,8 @@ def fetch(
     safe_asset = urllib.parse.quote(asset["asset_id"], safe="")
     safe_library = urllib.parse.quote(library_id, safe="")
     size_query = _cell_size_query(ctx)
+    if options.get("resolution") == "full":
+        size_query += "&full=1" if size_query else "?full=1"
     return {
         "library_name": library.get("name") or library_id,
         "asset_id": asset["asset_id"],
@@ -1482,31 +1492,46 @@ def blueprint() -> Blueprint:
         # ``?thumb=1`` (the Lineups previews): Immich's small thumbnail first,
         # never read just to be scaled up, and cacheable by the browser.
         thumb = request.args.get("thumb") == "1"
-        cascade = (
+        cascade: tuple[str, ...] = (
             ("/api/assets/{asset_id}/thumbnail?size=thumbnail", IMMICH_THUMB_CASCADE[0])
             if thumb
             else IMMICH_THUMB_CASCADE
         )
         if thumb:
             target = None
+        full = request.args.get("full") == "1" and not thumb
+        cascade = (IMMICH_ORIGINAL, *cascade) if full else (*cascade, IMMICH_ORIGINAL)
         raw_bytes: bytes | None = None
         raw_ct: str | None = None
-        for tmpl in (
-            *cascade,
-            IMMICH_ORIGINAL,
-        ):
+        for tmpl in cascade:
+            if full and tmpl == IMMICH_ORIGINAL:
+                # An original this host can't draw (a RAW file, one past
+                # Pillow's pixel limit) or one too big to hold in memory is
+                # skipped, and the previews below are tried as in Standard.
+                original = _read_original(
+                    base, safe_asset, key, asset_id, max_bytes=FULL_ORIGINAL_MAX_BYTES
+                )
+                if original is not None and _decodable(original[0]):
+                    raw_bytes, raw_ct = original
+                    break
+                continue
             url = f"{base}{tmpl.format(asset_id=safe_asset)}"
             req = urllib.request.Request(url, headers=_api_headers(key))
             try:
                 with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as upstream:
                     candidate = upstream.read()
                     candidate_ct = upstream.headers.get("Content-Type") or "image/jpeg"
-                if target is not None and tmpl != IMMICH_ORIGINAL and not _covers(candidate, target):
+                if (
+                    target is not None
+                    and not full
+                    and tmpl != IMMICH_ORIGINAL
+                    and not _covers(candidate, target)
+                ):
                     # Too small for this cell: keep it as the fallback and
                     # read the original instead.
                     raw_bytes, raw_ct = candidate, candidate_ct
                     original = _read_original(base, safe_asset, key, asset_id)
-                    if original is not None:
+                    if original is not None and _decodable(original[0]):
                         raw_bytes, raw_ct = original
                     break
                 raw_bytes, raw_ct = candidate, candidate_ct
@@ -1541,6 +1566,13 @@ def blueprint() -> Blueprint:
         elif thumb:
             body, content_type = _downscale_jpeg(
                 raw_bytes, raw_ct or "image/jpeg", edge=THUMB_MAX_EDGE_PX
+            )
+        elif full:
+            body, content_type = _downscale_jpeg(
+                raw_bytes,
+                raw_ct or "image/jpeg",
+                edge=PROXY_FULL_MAX_EDGE_PX,
+                quality=PROXY_FULL_JPEG_QUALITY,
             )
         else:
             body, content_type = _downscale_jpeg(raw_bytes, raw_ct or "image/jpeg")
@@ -1601,14 +1633,47 @@ def _covers(raw: bytes, target: tuple[int, int]) -> bool:
     return _cover_scale(size, target) <= 1.02
 
 
+def _decodable(raw: bytes) -> bool:
+    """Whether Pillow can open ``raw`` at all, judged from its header: False
+    for a format it doesn't know (most RAW files) and for an image past its
+    pixel limit, which it refuses as a decompression bomb."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as im:
+                return im.size[0] > 0 and im.size[1] > 0
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        return False
+
+
 def _read_original(
-    base: str, safe_asset: str, key: str, asset_id: str
+    base: str, safe_asset: str, key: str, asset_id: str, *, max_bytes: int | None = None
 ) -> tuple[bytes, str] | None:
+    """The asset's original file, or None when it can't be read. With
+    ``max_bytes``, None too for a file larger than that, without holding
+    more than ``max_bytes`` of it."""
     url = f"{base}{IMMICH_ORIGINAL.format(asset_id=safe_asset)}"
     req = urllib.request.Request(url, headers=_api_headers(key))
     try:
         with urllib.request.urlopen(req, timeout=PROXY_TIMEOUT_S) as upstream:
-            return upstream.read(), upstream.headers.get("Content-Type") or "image/jpeg"
+            content_type = upstream.headers.get("Content-Type") or "image/jpeg"
+            if max_bytes is None:
+                return upstream.read(), content_type
+            declared = upstream.headers.get("Content-Length") or ""
+            if declared.isdigit() and int(declared) > max_bytes:
+                logger.info("picture_immich: original of %s is over the size limit", asset_id)
+                return None
+            body = upstream.read(max_bytes + 1)
+            if len(body) > max_bytes:
+                logger.info("picture_immich: original of %s is over the size limit", asset_id)
+                return None
+            return body, content_type
     except (urllib.error.URLError, OSError) as exc:
         logger.info("picture_immich: original fetch failed for %s: %s", asset_id, exc)
         return None
@@ -1644,9 +1709,13 @@ def _cover_jpeg(
 
 
 def _downscale_jpeg(
-    raw: bytes, content_type: str, edge: int = PROXY_MAX_EDGE_PX
+    raw: bytes,
+    content_type: str,
+    edge: int = PROXY_MAX_EDGE_PX,
+    *,
+    quality: int = PROXY_JPEG_QUALITY,
 ) -> tuple[bytes, str]:
-    """Open with Pillow, resize the long edge down to ``PROXY_MAX_EDGE_PX``,
+    """Open with Pillow, resize the long edge down to ``edge``,
     re-encode as JPEG. On any decode failure (HEIC without pillow-heif
     installed, exotic formats, truncated bytes), pass the bytes
     through unchanged so a half-working cell beats a 502 tile."""
@@ -1657,7 +1726,7 @@ def _downscale_jpeg(
             if im.mode not in {"RGB", "L"}:
                 im = im.convert("RGB")
             buf = io.BytesIO()
-            im.save(buf, format="JPEG", quality=PROXY_JPEG_QUALITY, optimize=True)
+            im.save(buf, format="JPEG", quality=quality, optimize=True)
             return buf.getvalue(), "image/jpeg"
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         logger.info(

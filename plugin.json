@@ -81,6 +81,17 @@
       ]
     },
     {
+      "name": "resolution",
+      "type": "select",
+      "label": "Resolution",
+      "default": "standard",
+      "choices": [
+        {"value": "standard", "label": "Standard"},
+        {"value": "full", "label": "Full"}
+      ],
+      "help": "Standard uses a preview when it covers the cell. Full reads the original first for TVs and other large screens; it may take longer. Both size the photo to the cell. Without a cell size, Full keeps up to 3840 px."
+    },
+    {
       "name": "show_caption",
       "type": "boolean",
       "label": "Show date / location caption",

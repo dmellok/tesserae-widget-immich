@@ -139,6 +139,13 @@ preview (1440 px on the short edge by default) is used when it covers the cell;
 a bigger cell reads the original and scales it down to just cover the cell.
 `/original` needs the `asset.download` permission on the API key.
 
+Set **Resolution** to **Full** to read the original first, even when a preview
+covers the cell. This can help on TVs and other large screens when Immich's
+preview looks soft. The photo is still sized to the cell and never enlarged.
+If the original cannot be read, the widget uses a preview. On older hosts that
+do not pass a cell size, Full keeps up to 3840 px on the long edge; Standard
+keeps the existing 2000 px limit. Lineups previews stay small in either mode.
+
 ## HEIC support
 
 Most iPhone photos arrive as HEIC. The widget transcodes HEIC to
