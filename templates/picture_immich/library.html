@@ -38,8 +38,8 @@
         <label for="immich-url">URL</label>
         <input type="url" id="immich-url" name="url" required
                value="{{ library.url if library else '' }}"
-               placeholder="http://immich.home.lan:2283">
-        <p class="field-help">No trailing slash. Tesserae appends <code>/api/...</code> itself. Default Immich port is <code>2283</code>.</p>
+               placeholder="https://immich.example.com">
+        <p class="field-help">The server's full http:// or https:// address, including a port if needed, without a trailing slash. Tesserae appends <code>/api/...</code> itself. Default Immich port is <code>2283</code>.</p>
       </div>
 
       <div class="field">

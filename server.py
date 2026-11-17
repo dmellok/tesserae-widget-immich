@@ -1202,7 +1202,7 @@ def choices(name: str) -> list[dict[str, Any]]:
         libraries = _load_libraries(data_dir)
         if not libraries:
             return [
-                {"value": "", "label": "Add an Immich library under Widgets → Immich"}
+                {"value": "", "label": "Add an Immich library under Widgets → Immich", "note": True}
             ]
         return [
             {"value": lib["id"], "label": lib.get("name") or lib["id"]}
@@ -1223,7 +1223,7 @@ def choices(name: str) -> list[dict[str, Any]]:
                     }
                 )
         if not out:
-            return [{"value": "", "label": "No albums; check the library connection."}]
+            return [{"value": "", "label": "No albums; check the library connection.", "note": True}]
         return out
     if name == "tags":
         # Same cross-library collapse and "<tag>, <library>" labels as
@@ -1245,6 +1245,7 @@ def choices(name: str) -> list[dict[str, Any]]:
                 {
                     "value": "",
                     "label": "No tags; tag photos in Immich, or check the library connection.",
+                    "note": True,
                 }
             ]
         return hints + tags_out
