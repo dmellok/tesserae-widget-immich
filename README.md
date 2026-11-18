@@ -43,6 +43,15 @@ library is connected.
 Cells saved with the old `random_album` or `random_tag` modes open as Albums
 and tags with their one album or tag.
 
+### Orientation
+
+**Auto** (the default) shows each frame photos of its own shape when the
+dashboard is on both portrait and landscape frames, and any photo otherwise.
+**Match the frame** always does; **Portrait**, **Landscape** and **Square** keep
+that shape. Matching the frame keeps square photos too. The shape comes from
+Immich's photo size (an album's timeline `ratio`, so no extra calls). When no
+candidate has the shape, any photo is shown. Lineups lists every photo.
+
 ## Lineups
 
 On the Lineups page and in the lineup editor, a step showing this widget lists

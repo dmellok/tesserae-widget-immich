@@ -88,9 +88,9 @@ def test_any_picks_a_source_weighted_by_its_photo_count(server, monkeypatch) -> 
 
     monkeypatch.setattr(server.random, "choices", fake_choices)
     picked = []
-    monkeypatch.setattr(server, "_pick_asset_album", lambda lib, a: picked.append(a))
+    monkeypatch.setattr(server, "_pick_asset_album", lambda lib, a, *_: picked.append(a))
     monkeypatch.setattr(
-        server, "_pick_asset_tag", lambda lib, t: picked.append(t) or {"asset_id": t}
+        server, "_pick_asset_tag", lambda lib, t, *_: picked.append(t) or {"asset_id": t}
     )
     out = server.fetch(_opts(album_id=["a"], tag_id=["t1", "t2"]), {}, ctx={})
     assert out["asset_id"] == "t1"
@@ -104,9 +104,9 @@ def test_any_tries_another_source_when_one_comes_back_empty(
 ) -> None:
     monkeypatch.setattr(server, "_source_count", lambda lib, kind, sid: 5)
     monkeypatch.setattr(server.random, "choices", lambda population, weights: [0])
-    monkeypatch.setattr(server, "_pick_asset_album", lambda lib, a: None)
+    monkeypatch.setattr(server, "_pick_asset_album", lambda lib, a, *_: None)
     monkeypatch.setattr(
-        server, "_pick_asset_tag", lambda lib, t: {"asset_id": f"from-{t}"}
+        server, "_pick_asset_tag", lambda lib, t, *_: {"asset_id": f"from-{t}"}
     )
     out = server.fetch(_opts(album_id=["a"], tag_id=["t"]), {}, ctx={})
     assert out["asset_id"] == "from-t"
@@ -117,7 +117,7 @@ def test_one_album_keeps_the_shared_album_timeline(server, monkeypatch) -> None:
         server, "_source_count", lambda *a: pytest.fail("one source needs no count")
     )
     monkeypatch.setattr(
-        server, "_pick_asset_album", lambda lib, a: {"asset_id": f"from-{a}"}
+        server, "_pick_asset_album", lambda lib, a, *_: {"asset_id": f"from-{a}"}
     )
     out = server.fetch(_opts(album_id="a", match="all"), {}, ctx={})
     assert out["asset_id"] == "from-a"

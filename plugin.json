@@ -77,6 +77,39 @@
       "help": "Any: a photo from any chosen album or tag. Every: only photos that are in every chosen album and carry every chosen tag."
     },
     {
+      "name": "orientation",
+      "type": "select",
+      "label": "Orientation",
+      "default": "auto",
+      "choices": [
+        {
+          "value": "auto",
+          "label": "Auto"
+        },
+        {
+          "value": "frame",
+          "label": "Match the frame"
+        },
+        {
+          "value": "any",
+          "label": "Any"
+        },
+        {
+          "value": "portrait",
+          "label": "Portrait"
+        },
+        {
+          "value": "landscape",
+          "label": "Landscape"
+        },
+        {
+          "value": "square",
+          "label": "Square"
+        }
+      ],
+      "help": "Auto matches each frame's shape when the dashboard is on both portrait and landscape frames, and shows any photo otherwise. Match the frame always does. The others show only photos of that shape. When none have the shape, any photo is shown."
+    },
+    {
       "name": "scale",
       "type": "select",
       "label": "Scale",

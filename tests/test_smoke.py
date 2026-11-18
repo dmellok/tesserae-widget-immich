@@ -35,6 +35,7 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
         "album_id",
         "tag_id",
         "match",
+        "orientation",
         "scale",
         "resolution",
         "show_caption",
@@ -513,7 +514,7 @@ def test_fetch_returns_a_caption_only_when_a_format_is_set(monkeypatch) -> None:
     }
     monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
     monkeypatch.setattr(server, "_data_dir", lambda: None)
-    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib, *_: asset)
     base = {"library_id": "lib", "mode": "random"}
     assert server.fetch(base, {}, ctx={})["caption"] is None
     out = server.fetch({**base, "caption_format": _FORMAT}, {}, ctx={})
@@ -525,7 +526,7 @@ def test_fetch_asks_the_proxy_for_the_cell_size(monkeypatch) -> None:
     asset = {"asset_id": "a1", "taken_at": None, "location": None, "place": {}}
     monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
     monkeypatch.setattr(server, "_data_dir", lambda: None)
-    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib, *_: asset)
     base = {"library_id": "lib", "mode": "random"}
     assert server.fetch(base, {}, ctx={})["image_url"].endswith("/lib/a1")
     out = server.fetch(base, {}, ctx={"cell_w": 3840, "cell_h": 2160})
@@ -649,7 +650,7 @@ def test_full_resolution_keeps_the_cell_size_in_the_url(
     asset: dict = {"asset_id": "a1", "taken_at": None, "location": None, "place": {}}
     monkeypatch.setattr(server, "_by_id", lambda *a: {"id": "lib", "name": "Home"})
     monkeypatch.setattr(server, "_data_dir", lambda: None)
-    monkeypatch.setattr(server, "_pick_asset_random", lambda lib: asset)
+    monkeypatch.setattr(server, "_pick_asset_random", lambda lib, *_: asset)
     out = server.fetch(
         {"library_id": "lib", "mode": "random", "resolution": "full"}, {}, ctx=ctx
     )
