@@ -152,3 +152,67 @@ def test_memory_prefers_the_shape(server, monkeypatch) -> None:
     for _ in range(10):
         out = server._pick_asset_memory(LIB, frozenset({"landscape", "square"}))
         assert out["asset_id"] == "wide"
+
+
+def _search_page(*assets):
+    return {"assets": {"items": list(assets), "total": len(assets), "nextPage": None}}
+
+
+def test_lineups_list_only_what_each_frame_is_shown(
+    server, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        server, "_post_json", lambda *a: _search_page(WIDE, TALL, SQUARE)
+    )
+    opts = {"library_id": "home", "mode": "albums_tags", "tag_id": ["t"]}
+    base = {"data_dir": str(tmp_path), **MIXED}
+    wide = {**base, "cell_w": 800, "cell_h": 480}
+    tall = {**base, "cell_w": 480, "cell_h": 800}
+    assert [i["key"] for i in server.lineup_items(opts, ctx=wide)] == ["wide", "sq"]
+    assert [i["key"] for i in server.lineup_items(opts, ctx=tall)] == ["tall", "sq"]
+    assert server.lineup_item_count(opts, ctx=wide) == 2
+    # On frames of one shape, Auto lists every photo.
+    one = {
+        "data_dir": str(tmp_path),
+        "frame_shapes": ["landscape"],
+        "cell_w": 800,
+        "cell_h": 480,
+    }
+    assert server.lineup_item_count(opts, ctx=one) == 3
+    # A fixed Portrait lists portrait photos on any frame.
+    assert [
+        i["key"]
+        for i in server.lineup_items({**opts, "orientation": "portrait"}, ctx=one)
+    ] == ["tall"]
+
+
+def test_album_lineups_read_the_shape_from_the_timeline_ratio(
+    server, monkeypatch, tmp_path
+) -> None:
+    cols = {
+        "id": ["w1", "t1"],
+        "isImage": [True, True],
+        "isTrashed": [False, False],
+        "fileCreatedAt": ["2026-01-01T00:00:00Z"] * 2,
+        "ratio": [1.5, 0.75],
+    }
+
+    def fake(url, **kwargs):
+        if "/timeline/buckets" in url:
+            return [{"timeBucket": "2026-01-01", "count": 2}]
+        return cols
+
+    monkeypatch.setattr(server, "fetch_json", fake)
+    opts = {"library_id": "home", "mode": "albums_tags", "album_id": ["al"]}
+    ctx = {"data_dir": str(tmp_path), **MIXED, "cell_w": 480, "cell_h": 800}
+    assert [i["key"] for i in server.lineup_items(opts, ctx=ctx)] == ["t1"]
+
+
+def test_a_cut_short_list_scales_its_count_by_the_share_that_fits(server) -> None:
+    listing = {
+        "items": [{"id": "a", "shape": "landscape"}, {"id": "b", "shape": "portrait"}],
+        "total": 1000,
+    }
+    ctx = {**MIXED, "cell_w": 480, "cell_h": 800}
+    shown, total = server._frame_listing(listing, {}, ctx)
+    assert [i["id"] for i in shown] == ["b"] and total == 500

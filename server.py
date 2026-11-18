@@ -1124,7 +1124,8 @@ def _lineup_scopes(options: dict[str, Any], library_id: str) -> list[tuple[str, 
         scopes = [{"source": "random", "id": ""}]
     out = []
     for scope in scopes:
-        raw = f"{library_id}|{scope['source']}|{scope['id']}"
+        # v2: items carry their shape, so older listings are read afresh.
+        raw = f"v2|{library_id}|{scope['source']}|{scope['id']}"
         key = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
         out.append((key, scope))
     return out
@@ -1189,7 +1190,12 @@ def _lineup_item(asset: dict[str, Any]) -> dict[str, str] | None:
         return None
     name = asset.get("originalFileName")
     day = _day_of(asset.get("localDateTime") or asset.get("fileCreatedAt"))
-    return {"id": asset_id, "label": str(name or day or asset_id[:8])}
+    item = {"id": asset_id, "label": str(name or day or asset_id[:8])}
+    # Kept so a frame's list can hold only the shape the frame is shown.
+    shape = _asset_shape(asset)
+    if shape:
+        item["shape"] = shape
+    return item
 
 
 def _album_items_step(
@@ -1238,11 +1244,13 @@ def _album_items_step(
         is_image = cols.get("isImage") or [True] * n
         trashed = cols.get("isTrashed") or [False] * n
         created = cols.get("fileCreatedAt") or [""] * n
-        for asset_id, image, gone, when in zip(
-            cols["id"], is_image, trashed, created, strict=False
+        ratios = cols.get("ratio") or [None] * n
+        for asset_id, image, gone, when, ratio in zip(
+            cols["id"], is_image, trashed, created, ratios, strict=False
         ):
             if image and not gone:
-                item = _lineup_item({"id": asset_id, "fileCreatedAt": when})
+                size = {"width": ratio, "height": 1} if isinstance(ratio, (int, float)) else {}
+                item = _lineup_item({"id": asset_id, "fileCreatedAt": when, **size})
                 if item:
                     items.append(item)
     if len(items) >= LINEUP_MAX_ITEMS and (pending or len(items) > LINEUP_MAX_ITEMS):
@@ -1463,6 +1471,7 @@ def lineup_items(
     listing = _lineup_listing(options, ctx)
     if listing is None:
         return []
+    shown, _total = _frame_listing(listing, options, ctx)
     safe_library = urllib.parse.quote(listing["library"], safe="")
     return [
         {
@@ -1473,7 +1482,7 @@ def lineup_items(
                 f"{urllib.parse.quote(item['id'], safe='')}?thumb=1"
             ),
         }
-        for item in listing["items"]
+        for item in shown
         if isinstance(item, dict) and item.get("id")
     ]
 
@@ -1486,9 +1495,25 @@ def lineup_item_count(
     listing = _lineup_listing(options, ctx)
     if listing is None:
         return None
-    total = listing.get("total")
-    n = max(len(listing["items"]), total if isinstance(total, int) else 0)
+    _shown, n = _frame_listing(listing, options, ctx)
     return n or None
+
+
+def _frame_listing(
+    listing: dict[str, Any], options: dict[str, Any], ctx: dict[str, Any] | None
+) -> tuple[list[dict[str, Any]], int]:
+    """``(the listed photos this frame is shown, how many it draws from)``:
+    the same orientation as a render (``_wanted_shapes`` with this frame's
+    cell size), all of them when none have the shape. A list cut short (a
+    big album, a random pool) scales its total by the share that fits."""
+    items = [i for i in listing["items"] if isinstance(i, dict) and i.get("id")]
+    total = listing.get("total")
+    total = max(len(items), total if isinstance(total, int) else 0)
+    shown = _prefer_shape(items, _wanted_shapes(options, ctx or {}), lambda i: i.get("shape"))
+    if len(shown) == len(items) or not items:
+        return shown, total
+    complete = len(items) >= total
+    return shown, len(shown) if complete else round(total * len(shown) / len(items))
 
 
 def _pinned_asset(library: dict[str, Any], asset_id: str) -> dict[str, Any] | None:

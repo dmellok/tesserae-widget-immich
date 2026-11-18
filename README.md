@@ -50,7 +50,8 @@ dashboard is on both portrait and landscape frames, and any photo otherwise.
 **Match the frame** always does; **Portrait**, **Landscape** and **Square** keep
 that shape. Matching the frame keeps square photos too. The shape comes from
 Immich's photo size (an album's timeline `ratio`, so no extra calls). When no
-candidate has the shape, any photo is shown. Lineups lists every photo.
+candidate has the shape, any photo is shown. Lineups lists, for each frame, only
+the photos that frame is shown, and counts them the same way.
 
 ## Lineups
 
