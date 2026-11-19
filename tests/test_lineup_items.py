@@ -104,7 +104,7 @@ def test_a_second_listing_reads_the_cache_not_immich(server, monkeypatch) -> Non
 def test_a_slow_album_fills_in_over_several_requests(server, monkeypatch) -> None:
     fake = _Timeline()
     monkeypatch.setattr(server, "fetch_json", fake)
-    clock = iter([0.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0])
+    clock = iter([0.0, 0.0, 0.0, 0.0, 99.0, 99.0, 99.0, 99.0, 99.0])
     monkeypatch.setattr(server.time, "monotonic", lambda: next(clock, 99.0))
     first = server.lineup_items(_opts(), ctx=_ctx(server))
     assert [i["key"] for i in first] == ["a1", "a2"]  # one bucket before the deadline
