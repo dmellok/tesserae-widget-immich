@@ -20,25 +20,45 @@ Immich servers.
 | `memory`         | "On this day in past years." Falls back to `random`   |
 |                  | when Immich returns no memory for today's date.       |
 | `random`         | A single random asset from the whole library.         |
-| `random_album`   | A single random asset from the chosen album,          |
-|                  | including other members' photos in a shared album.    |
+| `albums_tags`    | A single random asset from the chosen albums and     |
+|                  | tags (see below).                                     |
 
-### Random from tag (`random_tag`)
+### Albums and tags (`albums_tags`)
 
-Picks a single random asset carrying the chosen tag, so you can tag
-the photos you want on your displays in Immich and point a cell at
-that tag. The tag picker reads `/api/tags` and lists each tag by its
-full path (`Displays/Kitchen`), since Immich tags can be nested. The
-photo comes from `/api/search/random` with `tagIds`. The API key
-needs the `tag.read` permission; without it the picker shows "API key
-needs the tag.read permission" instead of your tags.
+Choose any number of albums and tags. **Match** decides how they combine:
+
+- **Any album or tag** (default): a photo from any of them. The album or tag
+  is picked weighted by its photo count, so every photo is about equally
+  likely. An album includes other members' photos in a shared album.
+- **Every album and tag**: only photos that are in every chosen album and
+  carry every chosen tag (`/api/search/random` with `albumIds` and `tagIds`).
+
+The tag picker reads `/api/tags` and lists each tag by its full path
+(`Displays/Kitchen`), since Immich tags can be nested; a parent tag includes
+the tags under it. The API key needs the `tag.read` permission; without it the
+picker shows "API key needs the tag.read permission" instead of your tags.
+Pickers name the library after each album or tag only when more than one
+library is connected.
+
+Cells saved with the old `random_album` or `random_tag` modes open as Albums
+and tags with their one album or tag.
+
+### Orientation
+
+**Auto** (the default) shows each frame photos of its own shape when the
+dashboard is on both portrait and landscape frames, and any photo otherwise.
+**Match the frame** always does; **Portrait**, **Landscape** and **Square** keep
+that shape. Matching the frame keeps square photos too. The shape comes from
+Immich's photo size (an album's timeline `ratio`, so no extra calls). When no
+candidate has the shape, any photo is shown. Lineups lists, for each frame, only
+the photos that frame is shown, and counts them the same way.
 
 ## Lineups
 
 On the Lineups page and in the lineup editor, a step showing this widget lists
-the photos it draws from, with previews and the real count: the chosen album's
-images (every member's, newest first), the photos carrying the chosen tag, or
-today's memory. A random library (and a memory day with no memories) lists a
+the photos it draws from, with previews and the real count: the chosen albums'
+images (every member's, newest first) and the photos carrying the chosen tags,
+each listed once, or today's memory. A random library (and a memory day with no memories) lists a
 pool of random photos and the library's image total. **Show chosen** pins the
 cell to one photo (the `pinned_asset` option, shown under Advanced); clear it to
 go back to the mode. A pinned cell shows exactly that photo and picks nothing.
