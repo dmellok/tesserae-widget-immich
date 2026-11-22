@@ -41,10 +41,10 @@ def server(monkeypatch, tmp_path):
     return mod
 
 
-def test_manifest_defaults_to_auto() -> None:
+def test_manifest_defaults_to_any_and_offers_auto() -> None:
     manifest = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
     opt = next(o for o in manifest["cell_options"] if o["name"] == "orientation")
-    assert opt["default"] == "auto"
+    assert opt["default"] == "any"
     assert [c["value"] for c in opt["choices"]][:3] == ["auto", "frame", "any"]
 
 
@@ -55,7 +55,12 @@ def test_manifest_defaults_to_auto() -> None:
         ("auto", {"cell_w": 480, "cell_h": 800, **MIXED}, {"portrait", "square"}),
         ("auto", {"cell_w": 800, "cell_h": 480, "frame_shapes": ["landscape"]}, None),
         ("auto", {"cell_w": 800, "cell_h": 480}, None),
-        (None, {"cell_w": 800, "cell_h": 480, **MIXED}, {"landscape", "square"}),
+        # Unset reads as the default, Any, even on mixed frames.
+        (None, {"cell_w": 800, "cell_h": 480, **MIXED}, None),
+        # Sizes that are not numbers are treated as unknown.
+        ("frame", {"cell_w": "wide", "cell_h": None}, None),
+        ("frame", {"cell_w": "x", "cell_h": "y", "panel_w": 480, "panel_h": 800}, {"portrait", "square"}),
+        ("frame", {"cell_w": "800", "cell_h": "480"}, {"landscape", "square"}),
         ("frame", {"cell_w": 480, "cell_h": 800}, {"portrait", "square"}),
         ("frame", {"panel_w": 1600, "panel_h": 1200}, {"landscape", "square"}),
         ("frame", {"cell_w": 500, "cell_h": 500}, None),
@@ -164,7 +169,12 @@ def test_lineups_list_only_what_each_frame_is_shown(
     monkeypatch.setattr(
         server, "_post_json", lambda *a: _search_page(WIDE, TALL, SQUARE)
     )
-    opts = {"library_id": "home", "mode": "albums_tags", "tag_id": ["t"]}
+    opts = {
+        "library_id": "home",
+        "mode": "albums_tags",
+        "tag_id": ["t"],
+        "orientation": "auto",
+    }
     base = {"data_dir": str(tmp_path), **MIXED}
     wide = {**base, "cell_w": 800, "cell_h": 480}
     tall = {**base, "cell_w": 480, "cell_h": 800}
@@ -203,9 +213,17 @@ def test_album_lineups_read_the_shape_from_the_timeline_ratio(
         return cols
 
     monkeypatch.setattr(server, "fetch_json", fake)
-    opts = {"library_id": "home", "mode": "albums_tags", "album_id": ["al"]}
+    opts = {
+        "library_id": "home",
+        "mode": "albums_tags",
+        "album_id": ["al"],
+        "orientation": "auto",
+    }
     ctx = {"data_dir": str(tmp_path), **MIXED, "cell_w": 480, "cell_h": 800}
     assert [i["key"] for i in server.lineup_items(opts, ctx=ctx)] == ["t1"]
+    # A cell that saved no orientation lists every photo, as it renders.
+    del opts["orientation"]
+    assert [i["key"] for i in server.lineup_items(opts, ctx=ctx)] == ["w1", "t1"]
 
 
 def test_a_cut_short_list_scales_its_count_by_the_share_that_fits(server) -> None:
@@ -214,5 +232,225 @@ def test_a_cut_short_list_scales_its_count_by_the_share_that_fits(server) -> Non
         "total": 1000,
     }
     ctx = {**MIXED, "cell_w": 480, "cell_h": 800}
-    shown, total = server._frame_listing(listing, {}, ctx)
+    shown, total = server._frame_listing(listing, {"orientation": "auto"}, ctx)
     assert [i["id"] for i in shown] == ["b"] and total == 500
+
+
+# ----- the default, and strict fixed shapes -----------------------------
+
+
+def test_an_unset_orientation_shows_any_photo_on_mixed_frames(
+    server, monkeypatch
+) -> None:
+    """A cell saved before the option existed is not narrowed to the frame."""
+    seen = set()
+    for pool in ([TALL, WIDE], [WIDE, TALL]):
+        monkeypatch.setattr(server, "_post_json", lambda *a, pool=pool: list(pool))
+        out = server.fetch(
+            {"library_id": "home", "mode": "random"},
+            {},
+            ctx={"cell_w": 480, "cell_h": 800, **MIXED},
+        )
+        seen.add(out["asset_id"])
+    assert seen == {"tall", "wide"}
+
+
+def _fixed(server, mode="random", orientation="portrait", **extra):
+    opts = {"library_id": "home", "mode": mode, "orientation": orientation, **extra}
+    return server.fetch(opts, {}, ctx={"cell_w": 800, "cell_h": 480, **MIXED})
+
+
+def test_a_fixed_shape_asks_again_until_it_finds_one(server, monkeypatch) -> None:
+    batches = [[WIDE] * 20, [WIDE] * 20, [WIDE] * 19 + [TALL]]
+    calls = []
+
+    def fake_post(url, headers, body, timeout):
+        calls.append(body)
+        return batches[len(calls) - 1]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    assert _fixed(server)["asset_id"] == "tall"
+    assert len(calls) == 3
+
+
+def test_a_fixed_shape_never_shows_another_shape(server, monkeypatch) -> None:
+    calls = []
+
+    def fake_post(url, headers, body, timeout):
+        calls.append(body)
+        return [WIDE, SQUARE] * 10
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    out = _fixed(server)
+    assert out == {
+        "error": "No portrait photos found in this library. Choose another "
+        "Orientation, or photos of that shape."
+    }
+    assert len(calls) == server.STRICT_SEARCH_TRIES  # bounded
+    # A photo of unknown size is not shown either.
+    monkeypatch.setattr(server, "_post_json", lambda *a: [{"id": "unknown"}])
+    assert "No square photos found" in _fixed(server, orientation="square")["error"]
+
+
+def test_a_short_batch_is_everything_so_the_search_stops(server, monkeypatch) -> None:
+    calls = []
+
+    def fake_post(url, headers, body, timeout):
+        calls.append(body)
+        return [WIDE, WIDE]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    out = _fixed(server, mode="albums_tags", tag_id=["t"])
+    assert "No portrait photos found in the chosen albums and tags" in out["error"]
+    assert len(calls) == 1
+
+
+def test_a_fixed_shape_with_immich_down_blames_the_connection(
+    server, monkeypatch
+) -> None:
+    def down(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(server, "_post_json", down)
+    monkeypatch.setattr(server, "fetch_json", down)
+    assert "Check the library connection" in _fixed(server)["error"]
+    out = _fixed(server, mode="albums_tags", album_id=["a"], tag_id=["t"], match="all")
+    assert "did not answer" in out["error"]
+
+
+def test_a_fixed_shape_with_every_keeps_the_two_messages_apart(
+    server, monkeypatch
+) -> None:
+    every = {"mode": "albums_tags", "album_id": ["a"], "tag_id": ["t"], "match": "all"}
+    monkeypatch.setattr(server, "_post_json", lambda *a: [])
+    assert "every chosen album" in _fixed(server, **every)["error"]
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE])
+    assert "No portrait photos found" in _fixed(server, **every)["error"]
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE, TALL])
+    assert _fixed(server, **every)["asset_id"] == "tall"
+
+
+def _album_api(monkeypatch, server, buckets):
+    """A fake album timeline: ``buckets`` maps a time bucket to its ratios."""
+    read = []
+
+    def fake(url, **kwargs):
+        if "/timeline/buckets" in url:
+            return [{"timeBucket": b, "count": len(r)} for b, r in buckets.items()]
+        if "/timeline/bucket?" in url:
+            bucket = next(b for b in buckets if b in url)
+            read.append(bucket)
+            ratios = buckets[bucket]
+            return {
+                "id": [f"{bucket}-{i}" for i in range(len(ratios))],
+                "isImage": [True] * len(ratios),
+                "isTrashed": [False] * len(ratios),
+                "ratio": ratios,
+            }
+        asset_id = url.rsplit("/", 1)[-1]
+        return {"id": asset_id, "originalMimeType": "image/jpeg"}
+
+    monkeypatch.setattr(server, "fetch_json", fake)
+    return read
+
+
+def test_a_fixed_shape_reads_more_album_buckets(server, monkeypatch) -> None:
+    buckets = {f"2026-0{m}-01": [1.5, 1.5] for m in range(1, 6)}
+    buckets["2026-06-01"] = [0.75]
+    read = _album_api(monkeypatch, server, buckets)
+    monkeypatch.setattr(
+        server, "_post_json", lambda *a: pytest.fail("the timeline has it")
+    )
+    for _ in range(5):
+        out = _fixed(server, mode="albums_tags", album_id=["al"])
+        assert out["asset_id"] == "2026-06-01-0"
+    assert len(read) <= 5 * server.STRICT_BUCKET_TRIES
+
+
+def test_an_album_without_the_fixed_shape_says_so(server, monkeypatch) -> None:
+    read = _album_api(
+        monkeypatch, server, {"2026-01-01": [1.5, 1.4], "2026-02-01": [1.5]}
+    )
+    monkeypatch.setattr(
+        server, "_post_json", lambda *a: pytest.fail("every bucket was read")
+    )
+    out = _fixed(server, mode="albums_tags", album_id=["al"])
+    assert "No portrait photos found in the chosen albums and tags" in out["error"]
+    assert sorted(read) == ["2026-01-01", "2026-02-01"]
+    # Auto and Match the frame still fall back to what the album has.
+    auto = _fixed(server, mode="albums_tags", album_id=["al"], orientation="frame")
+    assert auto["asset_id"].startswith("2026-")
+    tall = server.fetch(
+        {"library_id": "home", "mode": "albums_tags", "album_id": ["al"], "orientation": "frame"},
+        {},
+        ctx={"cell_w": 480, "cell_h": 800},
+    )
+    assert tall["asset_id"].startswith("2026-")
+
+
+def test_a_big_album_falls_through_to_the_search_when_buckets_run_out(
+    server, monkeypatch
+) -> None:
+    buckets = {f"20{y}-01-01": [1.5] for y in range(10, 30)}
+    read = _album_api(monkeypatch, server, buckets)
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE, TALL])
+    out = _fixed(server, mode="albums_tags", album_id=["al"])
+    assert out["asset_id"] == "tall"
+    assert len(read) == server.STRICT_BUCKET_TRIES
+
+
+def test_any_passes_over_a_source_without_the_fixed_shape(server, monkeypatch) -> None:
+    monkeypatch.setattr(server, "_source_counts", {})
+    monkeypatch.setattr(server, "_source_count", lambda lib, kind, sid: 5)
+    monkeypatch.setattr(server.random, "choices", lambda population, weights: [0])
+
+    def fake_post(url, headers, body, timeout):
+        return [WIDE] if body["tagIds"] == ["t1"] else [TALL]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    out = _fixed(server, mode="albums_tags", tag_id=["t1", "t2"])
+    assert out["asset_id"] == "tall"
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE])
+    out = _fixed(server, mode="albums_tags", tag_id=["t1", "t2"])
+    assert "No portrait photos found" in out["error"]
+
+
+def test_memory_of_a_fixed_shape_or_a_random_photo_of_it(server, monkeypatch) -> None:
+    memories = [{"data": {"year": 2020}, "assets": [WIDE]}]
+    monkeypatch.setattr(server, "fetch_json", lambda url, **k: memories)
+    assert server._pick_asset_memory(LIB, server.StrictShapes({"portrait"})) is None
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE, TALL])
+    assert _fixed(server, mode="memory")["asset_id"] == "tall"
+
+
+def test_a_pinned_photo_ignores_a_fixed_shape(server, monkeypatch) -> None:
+    monkeypatch.setattr(
+        server, "_pinned_asset", lambda lib, asset_id: {"asset_id": asset_id}
+    )
+    assert _fixed(server, pinned_asset="wide")["asset_id"] == "wide"
+
+
+def test_lineups_list_nothing_of_another_shape_for_a_fixed_shape(
+    server, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(server, "_post_json", lambda *a: _search_page(WIDE, SQUARE))
+    opts = {
+        "library_id": "home",
+        "mode": "albums_tags",
+        "tag_id": ["t"],
+        "orientation": "portrait",
+    }
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    assert server.lineup_items(opts, ctx=ctx) == []
+    assert server.lineup_item_count(opts, ctx=ctx) is None
+
+
+def test_an_album_timeline_without_ratios_is_no_proof_of_absence(
+    server, monkeypatch
+) -> None:
+    """An older server's timeline has no ratio column: the album is searched
+    instead of being reported as having no portrait photos."""
+    _album_api(monkeypatch, server, {"2026-01-01": [None, None]})
+    monkeypatch.setattr(server, "_post_json", lambda *a: [WIDE, TALL])
+    out = _fixed(server, mode="albums_tags", album_id=["al"])
+    assert out["asset_id"] == "tall"
