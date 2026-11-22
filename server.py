@@ -329,7 +329,141 @@ def _list_tags(library: dict[str, Any]) -> tuple[list[dict[str, Any]], str | Non
     return out, None
 
 
-def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
+# ----- Orientation ----------------------------------------------------
+#
+# ``orientation`` keeps photos of one shape; ``any`` (the default) keeps them
+# all. ``auto`` matches the cell's shape on each frame when the dashboard is
+# on both portrait and landscape frames (``ctx["frame_shapes"]``) and keeps
+# every shape otherwise; ``frame`` always matches the cell. Matching keeps
+# square photos too, and when no candidate has the shape any photo is shown
+# rather than none.
+#
+# ``portrait``, ``landscape`` and ``square`` are strict, as in the other
+# photo widgets: a photo of another shape (or of no known shape) is never
+# shown. Immich's search has no shape filter, so the widget filters what
+# Immich returns and asks again, a bounded number of times; when nothing of
+# the shape turns up the cell says so instead of showing something else.
+
+SQUARE_TOLERANCE = 0.05  # width / height this close to 1 counts as square
+SEARCH_BATCH = 20  # random photos Immich is asked for at a time
+STRICT_SEARCH_TRIES = 4  # batches searched for a fixed shape before giving up
+STRICT_BUCKET_TRIES = 6  # album time buckets read for a fixed shape
+
+
+class StrictShapes(frozenset):  # type: ignore[type-arg]
+    """The shapes of a fixed orientation: only these are ever shown."""
+
+
+class NoShapeMatchError(RuntimeError):
+    """Immich answered with photos, none of the fixed shape asked for."""
+
+
+def _shape_of(width: Any, height: Any) -> str | None:
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (width, height)):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    ratio = width / height
+    if abs(ratio - 1.0) <= SQUARE_TOLERANCE:
+        return "square"
+    return "landscape" if ratio > 1 else "portrait"
+
+
+def _asset_shape(asset: dict[str, Any]) -> str | None:
+    """A photo's shape as displayed. Immich's ``width`` / ``height`` already
+    follow the EXIF rotation; older servers only have the EXIF size, which is
+    swapped for a sideways orientation (5 to 8)."""
+    shape = _shape_of(asset.get("width"), asset.get("height"))
+    if shape:
+        return shape
+    exif = asset.get("exifInfo")
+    if not isinstance(exif, dict):
+        return None
+    w, h = exif.get("exifImageWidth"), exif.get("exifImageHeight")
+    if str(exif.get("orientation") or "") in ("5", "6", "7", "8"):
+        w, h = h, w
+    return _shape_of(w, h)
+
+
+def _wanted_shapes(options: dict[str, Any], ctx: dict[str, Any]) -> frozenset[str] | None:
+    """The photo shapes this render keeps, or None for every shape. A fixed
+    shape comes back as ``StrictShapes``. Unset reads as the default, Any, in
+    a render and in a Lineups listing alike."""
+    orientation = str(options.get("orientation") or "any").strip().lower()
+    if orientation in ("portrait", "landscape", "square"):
+        return StrictShapes({orientation})
+    if orientation == "auto":
+        if not {"landscape", "portrait"} <= set(ctx.get("frame_shapes") or ()):
+            return None
+    elif orientation != "frame":
+        return None
+
+    def size(wk: str, hk: str) -> tuple[int, int]:
+        try:
+            return int(ctx.get(wk) or 0), int(ctx.get(hk) or 0)
+        except (TypeError, ValueError):
+            return 0, 0
+
+    # The cell's size on this frame, else the panel's; unknown or square
+    # means there is no shape to match.
+    w, h = size("cell_w", "cell_h")
+    if w <= 0 or h <= 0:
+        w, h = size("panel_w", "panel_h")
+    if w <= 0 or h <= 0 or w == h:
+        return None
+    return frozenset({"landscape" if w > h else "portrait", "square"})
+
+
+def _prefer_shape(
+    pool: list[Any], shapes: frozenset[str] | None, shape_of: Any = _asset_shape
+) -> list[Any]:
+    """The pool's photos of a wanted shape. When none are, the whole pool for
+    Auto and Match the frame, and nothing for a fixed shape."""
+    if not shapes:
+        return pool
+    kept = [item for item in pool if shape_of(item) in shapes]
+    if kept or isinstance(shapes, StrictShapes):
+        return kept
+    return pool
+
+
+def _shaped_search(
+    base: str,
+    key: str,
+    album_id: str | list[str] | None = None,
+    tag_id: str | list[str] | None = None,
+    shapes: frozenset[str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """Random photos from Immich narrowed to ``shapes``: None when Immich
+    did not answer, an empty list when it has nothing to offer.
+
+    For a fixed shape, a batch with none of it is asked for again, up to
+    ``STRICT_SEARCH_TRIES`` batches; a batch smaller than asked for is all
+    there is, so the search stops there. Photos but none of the shape raises
+    ``NoShapeMatchError``."""
+    strict = isinstance(shapes, StrictShapes)
+    seen_photos = False
+    for attempt in range(STRICT_SEARCH_TRIES if strict else 1):
+        payload = _fetch_random_assets(base, key, album_id, tag_id)
+        if payload is None:
+            if attempt == 0:
+                return None
+            break
+        pool = [a for a in payload if isinstance(a, dict) and a.get("id")]
+        kept = _prefer_shape(pool, shapes)
+        if kept or not strict:
+            return kept
+        seen_photos = seen_photos or bool(pool)
+        if len(payload) < SEARCH_BATCH:
+            break
+    if seen_photos:
+        raise NoShapeMatchError
+    return []
+
+
+def _pick_asset_memory(
+    library: dict[str, Any], shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
@@ -365,6 +499,9 @@ def _pick_asset_memory(library: dict[str, Any]) -> dict[str, Any] | None:
                     flat.append({"asset": asset, "memory_year": year_offset})
     if not flat:
         return None
+    flat = _prefer_shape(flat, shapes, lambda item: _asset_shape(item["asset"]))
+    if not flat:
+        return None  # no memory of a fixed shape: the caller picks at random
     chosen = random.choice(flat)  # noqa: S311  (display-only, not crypto)
     asset = chosen["asset"]
     # Memories assets come straight off the asset table with no exif
@@ -588,7 +725,7 @@ def _fetch_random_assets(
     # ``withExif`` matters: without it Immich omits ``exifInfo`` from
     # search results entirely, and the caption loses its reverse-geocoded
     # city / state / country.
-    body: dict[str, Any] = {"size": 20, "withExif": True}
+    body: dict[str, Any] = {"size": SEARCH_BATCH, "withExif": True}
     album_ids = _ids(album_id)
     tag_ids = _ids(tag_id)
     if album_ids:
@@ -628,7 +765,9 @@ def _fetch_random_assets(
     return payload if isinstance(payload, list) else None
 
 
-def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
+def _pick_asset_random(
+    library: dict[str, Any], shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
     """Ask Immich for a bunch of random candidates so we can skip past
     formats Pillow (without pillow-heif) can't decode. Falls through
     to the first asset if every candidate is HEIC."""
@@ -636,10 +775,7 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
         return None
-    payload = _fetch_random_assets(base, key)
-    if not payload:
-        return None
-    candidates = [a for a in payload if isinstance(a, dict) and a.get("id")]
+    candidates = _shaped_search(base, key, shapes=shapes)
     if not candidates:
         return None
     # When HEIF is available, every format is fair game; when it
@@ -667,7 +803,9 @@ def _pick_asset_random(library: dict[str, Any]) -> dict[str, Any] | None:
 _ALBUM_BUCKET_TRIES = 3
 
 
-def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
+def _album_image_ids(
+    base: str, key: str, album_id: str, shapes: frozenset[str] | None = None
+) -> list[str] | None:
     """Image ids from one time bucket of the album, whoever owns them.
 
     ``POST /api/search/random`` with ``albumIds`` only returns assets owned
@@ -681,9 +819,22 @@ def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
     calls however many years the album spans. A bucket with no images
     left after skipping videos and trashed assets is swapped for another,
     up to ``_ALBUM_BUCKET_TRIES``. Returns ``None`` when the timeline API is
-    unavailable (e.g. an older server) so the caller can fall back."""
+    unavailable (e.g. an older server) so the caller can fall back.
+
+    With ``shapes``, a bucket's images are narrowed by the ``ratio`` column
+    and a bucket with none of those shapes counts as empty; if no bucket
+    tried has one, the first bucket's images are returned anyway.
+
+    A fixed shape (``StrictShapes``) reads up to ``STRICT_BUCKET_TRIES``
+    buckets and never returns another shape: when every bucket was read and
+    none holds it, ``NoShapeMatchError``; when buckets were left unread, or
+    the server gave no ``ratio`` to judge by, an empty list, so the caller
+    can look further."""
+    strict = isinstance(shapes, StrictShapes)
     headers = _api_headers(key)
     quoted = urllib.parse.quote(album_id, safe="")
+    unshaped: list[str] = []
+    unsized = False  # some image came without a ratio (an older server)
     try:
         buckets = fetch_json(
             f"{base}/api/timeline/buckets?albumId={quoted}",
@@ -703,7 +854,8 @@ def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
                     pool.append((time_bucket, count))
             else:
                 pool.append((time_bucket, 1))
-        for _ in range(min(_ALBUM_BUCKET_TRIES, len(pool))):
+        tries = STRICT_BUCKET_TRIES if strict else _ALBUM_BUCKET_TRIES
+        for _ in range(min(tries, len(pool))):
             weights = [weight for _, weight in pool]
             index = random.choices(range(len(pool)), weights=weights)[0]  # noqa: S311
             time_bucket, _weight = pool.pop(index)
@@ -718,24 +870,43 @@ def _album_image_ids(base: str, key: str, album_id: str) -> list[str] | None:
             n = len(cols["id"])
             is_image = cols.get("isImage") or [True] * n
             trashed = cols.get("isTrashed") or [False] * n
-            ids = [
-                asset_id
-                for asset_id, image, gone in zip(cols["id"], is_image, trashed, strict=False)
+            ratios = cols.get("ratio") or [None] * n
+            images = [
+                (asset_id, ratio)
+                for asset_id, image, gone, ratio in zip(
+                    cols["id"], is_image, trashed, ratios, strict=False
+                )
                 if isinstance(asset_id, str) and image and not gone
             ]
-            if ids:
-                return ids
+            if shapes and images:
+                unshaped = unshaped or [asset_id for asset_id, _ in images]
+                unsized = unsized or any(
+                    not isinstance(ratio, (int, float)) for _, ratio in images
+                )
+                images = [
+                    (asset_id, ratio)
+                    for asset_id, ratio in images
+                    if isinstance(ratio, (int, float)) and _shape_of(ratio, 1) in shapes
+                ]
+            if images:
+                return [asset_id for asset_id, _ in images]
     except Exception as exc:
         logger.info("picture_immich: album timeline failed for %s: %s", album_id, exc)
-        return None
-    return []
+        return None if strict else (unshaped or None)
+    if strict:
+        if unshaped and not pool and not unsized:
+            raise NoShapeMatchError
+        return []
+    return unshaped
 
 
-def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, Any] | None:
+def _pick_asset_album_timeline(
+    base: str, key: str, album_id: str, shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
     """Random album asset from the timeline listing, with its detail
     (``GET /api/assets/{id}``) for the date, MIME type and place. Without
     pillow-heif, tries a few candidates for a browser-friendly one."""
-    ids = _album_image_ids(base, key, album_id)
+    ids = _album_image_ids(base, key, album_id, shapes)
     if not ids:
         return None
     random.shuffle(ids)  # noqa: S311  (display-only)
@@ -770,18 +941,17 @@ def _pick_asset_album_timeline(base: str, key: str, album_id: str) -> dict[str, 
     }
 
 
-def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] | None:
+def _pick_asset_album(
+    library: dict[str, Any], album_id: str, shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key and album_id):
         return None
-    picked = _pick_asset_album_timeline(base, key, album_id)
+    picked = _pick_asset_album_timeline(base, key, album_id, shapes)
     if picked is not None:
         return picked
-    payload = _fetch_random_assets(base, key, album_id)
-    if not payload:
-        return None
-    pool = [a for a in payload if isinstance(a, dict) and a.get("id")]
+    pool = _shaped_search(base, key, album_id, shapes=shapes)
     if not pool:
         return None
     random.shuffle(pool)  # noqa: S311  (display-only)
@@ -802,12 +972,14 @@ def _pick_asset_album(library: dict[str, Any], album_id: str) -> dict[str, Any] 
     }
 
 
-def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | None:
+def _pick_asset_tag(
+    library: dict[str, Any], tag_id: str, shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key and tag_id):
         return None
-    return _picked(_fetch_random_assets(base, key, tag_id=tag_id) or [])
+    return _picked(_shaped_search(base, key, tag_id=tag_id, shapes=shapes) or [], shapes)
 
 
 # ----- Albums and tags ------------------------------------------------
@@ -858,10 +1030,16 @@ def _selection(options: dict[str, Any]) -> tuple[list[str], list[str], str]:
     return albums, tags, match
 
 
-def _picked(pool: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """One random asset from a search result, preferring a format Pillow
-    can draw when there is no HEIF decoder, in the shape ``fetch`` uses."""
+def _picked(
+    pool: list[dict[str, Any]], shapes: frozenset[str] | None = None
+) -> dict[str, Any] | None:
+    """One random asset from a search result, preferring the wanted shapes,
+    then a format Pillow can draw when there is no HEIF decoder, in the
+    shape ``fetch`` uses."""
     pool = [a for a in pool if isinstance(a, dict) and a.get("id")]
+    if not pool:
+        return None
+    pool = _prefer_shape(pool, shapes)
     if not pool:
         return None
     random.shuffle(pool)  # noqa: S311  (display-only)
@@ -985,11 +1163,18 @@ def _source_count(library: dict[str, Any], kind: str, source_id: str) -> int:
 
 
 def _pick_asset_any(
-    library: dict[str, Any], album_ids: list[str], tag_ids: list[str]
+    library: dict[str, Any],
+    album_ids: list[str],
+    tag_ids: list[str],
+    shapes: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
     """A photo from one of the chosen albums or tags. With more than one,
     the source is picked weighted by its photo count, so each photo is
-    about equally likely; an empty source is skipped."""
+    about equally likely; an empty source is skipped. For a fixed shape, a
+    source with none of it is passed over like an empty one, and
+    ``NoShapeMatchError`` is raised when no source tried gave a photo and at
+    least one had photos of other shapes."""
+    no_match = False
     sources = [("album", a) for a in album_ids] + [("tag", t) for t in tag_ids]
     if len(sources) > 1:
         weighted = [(s, _source_count(library, *s)) for s in sources]
@@ -999,17 +1184,26 @@ def _pick_asset_any(
     for _ in range(min(_ANY_PICK_TRIES, len(remaining))):
         index = random.choices(range(len(remaining)), weights=[w for _, w in remaining])[0]  # noqa: S311
         (kind, source_id), _weight = remaining.pop(index)
-        if kind == "album":
-            asset = _pick_asset_album(library, source_id)
-        else:
-            asset = _pick_asset_tag(library, source_id)
+        try:
+            if kind == "album":
+                asset = _pick_asset_album(library, source_id, shapes)
+            else:
+                asset = _pick_asset_tag(library, source_id, shapes)
+        except NoShapeMatchError:
+            no_match = True
+            continue
         if asset is not None:
             return asset
+    if no_match:
+        raise NoShapeMatchError
     return None
 
 
 def _pick_asset_every(
-    library: dict[str, Any], album_ids: list[str], tag_ids: list[str]
+    library: dict[str, Any],
+    album_ids: list[str],
+    tag_ids: list[str],
+    shapes: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
     """A photo in every chosen album that carries every chosen tag, or None
     when there is none. Raises ``SearchFailedError`` when Immich did not
@@ -1021,18 +1215,22 @@ def _pick_asset_every(
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
         raise SearchFailedError("library has no URL or API key")
-    payload = _fetch_random_assets(base, key, album_ids, tag_ids)
+    payload = _shaped_search(base, key, album_ids, tag_ids, shapes)
     if payload is None:
         raise SearchFailedError("search/random failed")
-    return _picked(payload)
+    return _picked(payload, shapes)
 
 
 def _pick_asset_collection(
-    library: dict[str, Any], album_ids: list[str], tag_ids: list[str], match: str
+    library: dict[str, Any],
+    album_ids: list[str],
+    tag_ids: list[str],
+    match: str,
+    shapes: frozenset[str] | None = None,
 ) -> dict[str, Any] | None:
     if match == "all" and len(album_ids) + len(tag_ids) > 1:
-        return _pick_asset_every(library, album_ids, tag_ids)
-    return _pick_asset_any(library, album_ids, tag_ids)
+        return _pick_asset_every(library, album_ids, tag_ids, shapes)
+    return _pick_asset_any(library, album_ids, tag_ids, shapes)
 
 
 # ----- Lineups items --------------------------------------------------
@@ -1091,7 +1289,8 @@ def _lineup_scopes(options: dict[str, Any], library_id: str) -> list[tuple[str, 
         scopes = [{"source": "random", "id": ""}]
     out = []
     for scope in scopes:
-        raw = f"{library_id}|{scope['source']}|{scope['id']}"
+        # v2: items carry their shape, so older listings are read afresh.
+        raw = f"v2|{library_id}|{scope['source']}|{scope['id']}"
         key = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
         out.append((key, scope))
     return out
@@ -1156,7 +1355,12 @@ def _lineup_item(asset: dict[str, Any]) -> dict[str, str] | None:
         return None
     name = asset.get("originalFileName")
     day = _day_of(asset.get("localDateTime") or asset.get("fileCreatedAt"))
-    return {"id": asset_id, "label": str(name or day or asset_id[:8])}
+    item = {"id": asset_id, "label": str(name or day or asset_id[:8])}
+    # Kept so a frame's list can hold only the shape the frame is shown.
+    shape = _asset_shape(asset)
+    if shape:
+        item["shape"] = shape
+    return item
 
 
 def _album_items_step(
@@ -1205,11 +1409,13 @@ def _album_items_step(
         is_image = cols.get("isImage") or [True] * n
         trashed = cols.get("isTrashed") or [False] * n
         created = cols.get("fileCreatedAt") or [""] * n
-        for asset_id, image, gone, when in zip(
-            cols["id"], is_image, trashed, created, strict=False
+        ratios = cols.get("ratio") or [None] * n
+        for asset_id, image, gone, when, ratio in zip(
+            cols["id"], is_image, trashed, created, ratios, strict=False
         ):
             if image and not gone:
-                item = _lineup_item({"id": asset_id, "fileCreatedAt": when})
+                size = {"width": ratio, "height": 1} if isinstance(ratio, (int, float)) else {}
+                item = _lineup_item({"id": asset_id, "fileCreatedAt": when, **size})
                 if item:
                     items.append(item)
     if len(items) >= LINEUP_MAX_ITEMS and (pending or len(items) > LINEUP_MAX_ITEMS):
@@ -1430,6 +1636,7 @@ def lineup_items(
     listing = _lineup_listing(options, ctx)
     if listing is None:
         return []
+    shown, _total = _frame_listing(listing, options, ctx)
     safe_library = urllib.parse.quote(listing["library"], safe="")
     return [
         {
@@ -1440,7 +1647,7 @@ def lineup_items(
                 f"{urllib.parse.quote(item['id'], safe='')}?thumb=1"
             ),
         }
-        for item in listing["items"]
+        for item in shown
         if isinstance(item, dict) and item.get("id")
     ]
 
@@ -1453,9 +1660,25 @@ def lineup_item_count(
     listing = _lineup_listing(options, ctx)
     if listing is None:
         return None
-    total = listing.get("total")
-    n = max(len(listing["items"]), total if isinstance(total, int) else 0)
+    _shown, n = _frame_listing(listing, options, ctx)
     return n or None
+
+
+def _frame_listing(
+    listing: dict[str, Any], options: dict[str, Any], ctx: dict[str, Any] | None
+) -> tuple[list[dict[str, Any]], int]:
+    """``(the listed photos this frame is shown, how many it draws from)``:
+    the same orientation as a render (``_wanted_shapes`` with this frame's
+    cell size), all of them when none have the shape. A list cut short (a
+    big album, a random pool) scales its total by the share that fits."""
+    items = [i for i in listing["items"] if isinstance(i, dict) and i.get("id")]
+    total = listing.get("total")
+    total = max(len(items), total if isinstance(total, int) else 0)
+    shown = _prefer_shape(items, _wanted_shapes(options, ctx or {}), lambda i: i.get("shape"))
+    if len(shown) == len(items) or not items:
+        return shown, total
+    complete = len(items) >= total
+    return shown, len(shown) if complete else round(total * len(shown) / len(items))
 
 
 def _pinned_asset(library: dict[str, Any], asset_id: str) -> dict[str, Any] | None:
@@ -1568,39 +1791,49 @@ def fetch(
         return {"error": f"Library {library_id!r} no longer exists."}
 
     mode = (options.get("mode") or "memory").strip()
+    shapes = _wanted_shapes(options, ctx)
     asset: dict[str, Any] | None = None
     # A cell pinned from Lineups shows that photo and nothing else: no pick,
     # no history. A photo that is gone falls back to the cell's own mode.
     pinned = str(options.get(PIN_OPTION) or "").strip()
     if pinned:
         asset = _pinned_asset(library, pinned)
-    if asset is not None:
-        pass  # pinned: nothing to pick
-    elif mode == "random":
-        asset = _pick_asset_random(library)
-    elif mode in COLLECTION_MODES:
-        album_ids, tag_ids, match = _selection(options)
-        if not (album_ids or tag_ids):
-            return {"error": "Pick an album or a tag in the cell editor."}
-        try:
-            asset = _pick_asset_collection(library, album_ids, tag_ids, match)
-        except SearchFailedError:
-            return {
-                "error": "Immich did not answer the search for photos in every "
-                "chosen album and tag. Check the library connection."
-            }
-        if asset is None and match == "all" and len(album_ids) + len(tag_ids) > 1:
-            return {
-                "error": "No photo of yours is in every chosen album with every "
-                "chosen tag. Set Match to Any album or tag, or choose fewer. "
-                "Every only finds photos owned by the API key's user, so other "
-                "members' photos in a shared album don't count."
-            }
-    else:
-        # ``memory`` (default). Falls back to ``random`` when the
-        # library has no memory for today, so the cell still paints
-        # something useful rather than an empty error tile.
-        asset = _pick_asset_memory(library) or _pick_asset_random(library)
+    try:
+        if asset is not None:
+            pass  # pinned: nothing to pick
+        elif mode == "random":
+            asset = _pick_asset_random(library, shapes)
+        elif mode in COLLECTION_MODES:
+            album_ids, tag_ids, match = _selection(options)
+            if not (album_ids or tag_ids):
+                return {"error": "Pick an album or a tag in the cell editor."}
+            try:
+                asset = _pick_asset_collection(library, album_ids, tag_ids, match, shapes)
+            except SearchFailedError:
+                return {
+                    "error": "Immich did not answer the search for photos in every "
+                    "chosen album and tag. Check the library connection."
+                }
+            if asset is None and match == "all" and len(album_ids) + len(tag_ids) > 1:
+                return {
+                    "error": "No photo of yours is in every chosen album with every "
+                    "chosen tag. Set Match to Any album or tag, or choose fewer. "
+                    "Every only finds photos owned by the API key's user, so other "
+                    "members' photos in a shared album don't count."
+                }
+        else:
+            # ``memory`` (default). Falls back to ``random`` when the
+            # library has no memory for today, so the cell still paints
+            # something useful rather than an empty error tile.
+            asset = _pick_asset_memory(library, shapes) or _pick_asset_random(library, shapes)
+    except NoShapeMatchError:
+        # A fixed Portrait, Landscape or Square never shows another shape.
+        shape = next(iter(shapes or ()), "matching")
+        where = "the chosen albums and tags" if mode in COLLECTION_MODES else "this library"
+        return {
+            "error": f"No {shape} photos found in {where}. Choose another "
+            "Orientation, or photos of that shape."
+        }
 
     if asset is None or not asset.get("asset_id"):
         return {"error": "Immich returned no asset. Check the library connection."}

@@ -55,6 +55,28 @@ an older server those cells still show their photos, but the editor lists the
 old mode as unavailable and hides the album and tag pickers until you choose
 Albums and tags again.
 
+### Orientation
+
+The default is **Any**. **Auto** shows each frame photos the shape of the cell
+on that frame when the dashboard is on both portrait and landscape frames, and
+any photo otherwise. **Match the frame** always does. Both keep square photos
+too, and when no candidate has the shape, any photo is shown. Auto needs a
+Tesserae server newer than 0.514.0; on 0.514.0 and older it behaves as Any.
+
+**Portrait**, **Landscape** and **Square** are strict: a photo of another shape
+is never shown. Immich's search can't filter by shape, so the widget filters
+what Immich returns and asks again when a batch has none of the shape: up to 4
+batches of 20 random photos, or up to 6 months of an album. If nothing of the
+shape turns up, the cell says "No portrait photos found" instead of showing
+another shape. In a large library where the shape is very rare this can happen
+even though such photos exist; put them in an album or under a tag and point
+the cell at that. A photo whose size Immich doesn't report is left out of a
+fixed shape.
+
+The shape comes from Immich's photo size (an album's timeline `ratio`, so no
+extra calls). Lineups lists, for each frame, only the photos that frame is
+shown, and counts them the same way.
+
 ## Lineups
 
 On the Lineups page and in the lineup editor, a step showing this widget lists

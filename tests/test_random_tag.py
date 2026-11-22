@@ -193,7 +193,7 @@ def test_fetch_random_tag_mode(monkeypatch) -> None:
     monkeypatch.setattr(
         server,
         "_pick_asset_tag",
-        lambda library, tag_id: {"asset_id": f"from-{tag_id}", "location": None},
+        lambda library, tag_id, *_: {"asset_id": f"from-{tag_id}", "location": None},
     )
     out = server.fetch(
         {"library_id": "home", "mode": "random_tag", "tag_id": "tag-1"}, {}, ctx={}
