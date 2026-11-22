@@ -38,13 +38,16 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     )
 
 
-def test_manifest_declares_tag_mode_and_picker() -> None:
+def test_manifest_declares_albums_and_tags_mode_and_pickers() -> None:
     manifest = json.loads((ROOT / "plugin.json").read_text(encoding="utf-8"))
     mode = next(o for o in manifest["cell_options"] if o["name"] == "mode")
-    assert "random_tag" in {c["value"] for c in mode["choices"]}
-    tag_opt = next(o for o in manifest["cell_options"] if o["name"] == "tag_id")
-    assert tag_opt["type"] == "select"
-    assert tag_opt["choices_from"] == "tags"
+    merged = next(c for c in mode["choices"] if c["value"] == "albums_tags")
+    # Cells saved under the old one-source modes select the merged one.
+    assert merged["aliases"] == ["random_album", "random_tag"]
+    for name, source in (("album_id", "albums"), ("tag_id", "tags")):
+        opt = next(o for o in manifest["cell_options"] if o["name"] == name)
+        assert opt["type"] == "multiselect"
+        assert opt["choices_from"] == source
 
 
 def test_tag_uses_search_random_with_tagids(monkeypatch) -> None:
@@ -65,7 +68,12 @@ def test_tag_uses_search_random_with_tagids(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key", tag_id="tag-1")
     assert out == [{"id": "tagged", "originalMimeType": "image/jpeg"}]
     assert seen["url"].endswith("/api/search/random")
-    assert seen["body"] == {"size": 20, "withExif": True, "tagIds": ["tag-1"]}
+    assert seen["body"] == {
+        "size": 20,
+        "withExif": True,
+        "tagIds": ["tag-1"],
+        "type": "IMAGE",
+    }
 
 
 def test_tag_has_no_legacy_fallback(monkeypatch) -> None:
@@ -193,4 +201,4 @@ def test_fetch_random_tag_mode(monkeypatch) -> None:
     assert out["asset_id"] == "from-tag-1"
     assert out["mode"] == "random_tag"
     out = server.fetch({"library_id": "home", "mode": "random_tag"}, {}, ctx={})
-    assert out == {"error": "Pick a tag in the cell editor."}
+    assert out == {"error": "Pick an album or a tag in the cell editor."}

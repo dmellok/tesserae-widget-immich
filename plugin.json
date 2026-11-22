@@ -3,7 +3,7 @@
   "name": "Picture, Immich",
   "version": "0.6.0",
   "kind": "widget",
-  "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets \u2192 Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random library, random album, and random tag modes also supported.",
+  "description": "Full-bleed photos from your Immich library. Connect one or more Immich servers under Widgets \u2192 Immich, then pick a library + mode per cell. Default mode is today's memory (on this day in past years). Random photo, and random from any mix of albums and tags, also supported.",
   "icon": "ph-images-square",
   "supports": {
     "sizes": [
@@ -35,30 +35,46 @@
           "label": "Random photo"
         },
         {
-          "value": "random_album",
-          "label": "Random from album"
-        },
-        {
-          "value": "random_tag",
-          "label": "Random from tag"
+          "value": "albums_tags",
+          "label": "Albums and tags",
+          "aliases": ["random_album", "random_tag"]
         }
       ]
     },
     {
       "name": "album_id",
-      "type": "select",
-      "label": "Album",
-      "show_if": {"mode": "random_album"},
-      "default": "",
+      "type": "multiselect",
+      "label": "Albums",
+      "show_if": {"mode": "albums_tags"},
+      "default": [],
       "choices_from": "albums"
     },
     {
       "name": "tag_id",
+      "type": "multiselect",
+      "label": "Tags",
+      "show_if": {"mode": "albums_tags"},
+      "default": [],
+      "choices_from": "tags",
+      "help": "A parent tag includes the tags under it. The API key needs the tag.read permission."
+    },
+    {
+      "name": "match",
       "type": "select",
-      "label": "Tag",
-      "show_if": {"mode": "random_tag"},
-      "default": "",
-      "choices_from": "tags"
+      "label": "Match",
+      "show_if": {"mode": "albums_tags"},
+      "default": "any",
+      "choices": [
+        {
+          "value": "any",
+          "label": "Any album or tag"
+        },
+        {
+          "value": "all",
+          "label": "Every album and tag"
+        }
+      ],
+      "help": "Any: a photo from any chosen album or tag. Every: only photos that are in every chosen album and carry every chosen tag. Every only finds photos owned by the API key's user, so other members' photos in a shared album are left out; Any includes them."
     },
     {
       "name": "scale",

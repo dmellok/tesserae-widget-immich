@@ -20,25 +20,47 @@ Immich servers.
 | `memory`         | "On this day in past years." Falls back to `random`   |
 |                  | when Immich returns no memory for today's date.       |
 | `random`         | A single random asset from the whole library.         |
-| `random_album`   | A single random asset from the chosen album,          |
-|                  | including other members' photos in a shared album.    |
+| `albums_tags`    | A single random asset from the chosen albums and     |
+|                  | tags (see below).                                     |
 
-### Random from tag (`random_tag`)
+### Albums and tags (`albums_tags`)
 
-Picks a single random asset carrying the chosen tag, so you can tag
-the photos you want on your displays in Immich and point a cell at
-that tag. The tag picker reads `/api/tags` and lists each tag by its
-full path (`Displays/Kitchen`), since Immich tags can be nested. The
-photo comes from `/api/search/random` with `tagIds`. The API key
-needs the `tag.read` permission; without it the picker shows "API key
-needs the tag.read permission" instead of your tags.
+Choose any number of albums and tags. **Match** decides how they combine:
+
+- **Any album or tag** (default): a photo from any of them. The album or tag
+  is picked weighted by its photo count, so every photo is about equally
+  likely. An album includes other members' photos in a shared album.
+- **Every album and tag**: only photos that are in every chosen album and
+  carry every chosen tag (`/api/search/random` with `albumIds` and `tagIds`).
+  Immich's search only returns photos owned by the API key's user, so in a
+  shared album other members' photos are not found by Every. Use Any, or a
+  key belonging to the photos' owner, to show them.
+
+With Any and more than one album or tag, the widget needs each one's photo
+count. Album counts come from one `/api/albums` call. A tag's count comes from
+`/api/search/statistics`, which needs the `asset.statistics` permission;
+without it the widget counts one page of 250 photos, so a bigger tag weighs as
+250. Counts are kept for an hour.
+
+The tag picker reads `/api/tags` and lists each tag by its full path
+(`Displays/Kitchen`), since Immich tags can be nested; a parent tag includes
+the tags under it. The API key needs the `tag.read` permission; without it the
+picker shows "API key needs the tag.read permission" instead of your tags.
+Pickers name the library after each album or tag only when more than one
+library is connected.
+
+Cells saved with the old `random_album` or `random_tag` modes open as Albums
+and tags with their one album or tag. This needs Tesserae 0.499.3 or later. On
+an older server those cells still show their photos, but the editor lists the
+old mode as unavailable and hides the album and tag pickers until you choose
+Albums and tags again.
 
 ## Lineups
 
 On the Lineups page and in the lineup editor, a step showing this widget lists
-the photos it draws from, with previews and the real count: the chosen album's
-images (every member's, newest first), the photos carrying the chosen tag, or
-today's memory. A random library (and a memory day with no memories) lists a
+the photos it draws from, with previews and the real count: the chosen albums'
+images (every member's, newest first) and the photos carrying the chosen tags,
+each listed once, or today's memory. A random library (and a memory day with no memories) lists a
 pool of random photos and the library's image total. **Show chosen** pins the
 cell to one photo (the `pinned_asset` option, shown under Advanced); clear it to
 go back to the mode. A pinned cell shows exactly that photo and picks nothing.

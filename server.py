@@ -549,7 +549,10 @@ def _is_browser_friendly(mime: str | None) -> bool:
 
 
 def _fetch_random_assets(
-    base: str, key: str, album_id: str | None = None, tag_id: str | None = None
+    base: str,
+    key: str,
+    album_id: str | list[str] | None = None,
+    tag_id: str | list[str] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Fetch a batch of random assets, tolerant of the Immich API changes.
 
@@ -572,16 +575,28 @@ def _fetch_random_assets(
     object; the flat form is still accepted and is the only one older
     servers understand. There is no legacy fallback for tags (the old
     ``GET /api/assets/random`` can't filter), so a failure returns
-    ``None``."""
+    ``None``.
+
+    Either may be a list. Immich returns only assets in every listed album
+    that carry every listed tag; the legacy fallback covers one album. A
+    search narrowed to albums or tags asks for images only (``type``), as
+    the album timeline and the Lineups listings do.
+
+    ``None`` always means the request failed; an empty list means Immich
+    answered and nothing matched."""
     headers = _api_headers(key)
     # ``withExif`` matters: without it Immich omits ``exifInfo`` from
     # search results entirely, and the caption loses its reverse-geocoded
     # city / state / country.
     body: dict[str, Any] = {"size": 20, "withExif": True}
-    if album_id:
-        body["albumIds"] = [album_id]
-    if tag_id:
-        body["tagIds"] = [tag_id]
+    album_ids = _ids(album_id)
+    tag_ids = _ids(tag_id)
+    if album_ids:
+        body["albumIds"] = album_ids
+    if tag_ids:
+        body["tagIds"] = tag_ids
+    if album_ids or tag_ids:
+        body["type"] = "IMAGE"
     try:
         payload = _post_json(f"{base}/api/search/random", headers, body, HTTP_TIMEOUT_S)
         if isinstance(payload, list):
@@ -590,13 +605,13 @@ def _fetch_random_assets(
         logger.info(
             "picture_immich: search/random failed, trying legacy endpoint: %s", exc
         )
-    if tag_id:
+    if tag_ids or len(album_ids) > 1:
         return None
     # Legacy (pre-v3) fallbacks.
     try:
-        if album_id:
+        if album_ids:
             payload = fetch_json(
-                f"{base}/api/albums/{urllib.parse.quote(album_id)}",
+                f"{base}/api/albums/{urllib.parse.quote(album_ids[0])}",
                 headers=headers,
                 timeout=HTTP_TIMEOUT_S,
             )
@@ -792,16 +807,66 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key and tag_id):
         return None
-    payload = _fetch_random_assets(base, key, tag_id=tag_id)
-    if not payload:
-        return None
-    pool = [a for a in payload if isinstance(a, dict) and a.get("id")]
+    return _picked(_fetch_random_assets(base, key, tag_id=tag_id) or [])
+
+
+# ----- Albums and tags ------------------------------------------------
+#
+# The ``albums_tags`` mode draws from any mix of albums and tags. ``match``
+# ``any`` (the default) picks one chosen source, weighted by how many photos
+# it holds, then a photo from it. ``all`` asks Immich for photos in every
+# chosen album that carry every chosen tag (its search ANDs both filters).
+# Cells saved under the old one-source modes (``random_album``,
+# ``random_tag``) read as this mode with that one source.
+
+COLLECTION_MODES = ("albums_tags", "random_album", "random_tag")
+SOURCE_COUNT_TTL_S = 3600  # how long a source's photo count weights picks
+COUNT_FAILURE_TTL_S = 300  # how long a count Immich couldn't give is left alone
+TAG_COUNT_PAGE = 250  # photos read to count a tag when statistics are refused
+_ANY_PICK_TRIES = 3  # sources tried per render before giving up
+# (library id, kind, source id) -> (good until, value). ``album`` and ``tag``
+# hold one source's count (None: Immich couldn't say); ``albums`` holds the
+# library's album list as {album id: assetCount} (None: the list failed).
+_source_counts: dict[tuple[str, str, str], tuple[float, Any]] = {}
+
+
+class SearchFailedError(RuntimeError):
+    """Immich did not answer a search (down, unreachable, refused), as
+    opposed to answering with nothing."""
+
+
+def _ids(value: Any) -> list[str]:
+    """A multiselect value as a list of distinct ids. A cell saved while the
+    picker held one value has a bare string."""
+    raw = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in raw:
+        text = item.strip() if isinstance(item, str) else ""
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _selection(options: dict[str, Any]) -> tuple[list[str], list[str], str]:
+    """``(album ids, tag ids, match)`` for an albums-and-tags cell. An old
+    one-source cell keeps that one source, so a tag left from switching
+    modes doesn't join an album cell until the cell is saved again."""
+    mode = str(options.get("mode") or "").strip()
+    albums = [] if mode == "random_tag" else _ids(options.get("album_id"))
+    tags = [] if mode == "random_album" else _ids(options.get("tag_id"))
+    match = "all" if str(options.get("match") or "").strip() == "all" else "any"
+    return albums, tags, match
+
+
+def _picked(pool: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """One random asset from a search result, preferring a format Pillow
+    can draw when there is no HEIF decoder, in the shape ``fetch`` uses."""
+    pool = [a for a in pool if isinstance(a, dict) and a.get("id")]
     if not pool:
         return None
     random.shuffle(pool)  # noqa: S311  (display-only)
-    if _HEIF_AVAILABLE:
-        chosen = pool[0]
-    else:
+    chosen = pool[0]
+    if not _HEIF_AVAILABLE:
         chosen = next(
             (a for a in pool if _is_browser_friendly(a.get("originalMimeType"))),
             pool[0],
@@ -814,6 +879,160 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
         "location": _location_of(chosen),
         "place": _place_of(chosen),
     }
+
+
+def _count_cached(cache_key: tuple[str, str, str]) -> tuple[bool, Any]:
+    hit = _source_counts.get(cache_key)
+    if hit and time.time() < hit[0]:
+        return True, hit[1]
+    return False, None
+
+
+def _count_store(cache_key: tuple[str, str, str], value: Any) -> None:
+    """Keep a count for an hour, or a failure (None) for a few minutes so a
+    source Immich can't count is not asked about on every render."""
+    ttl = COUNT_FAILURE_TTL_S if value is None else SOURCE_COUNT_TTL_S
+    _source_counts[cache_key] = (time.time() + ttl, value)
+
+
+def _as_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _album_counts(library: dict[str, Any]) -> dict[str, int] | None:
+    """``{album id: assetCount}`` for the library from one ``GET /api/albums``
+    (the list the album picker shows), cached like a count. None when the
+    list can't be read."""
+    cache_key = (str(library.get("id") or ""), "albums", "")
+    known, value = _count_cached(cache_key)
+    if known:
+        return value
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    counts: dict[str, int] | None = None
+    try:
+        payload = fetch_json(
+            f"{base}/api/albums", headers=_api_headers(key), timeout=HTTP_TIMEOUT_S
+        )
+        if isinstance(payload, list):
+            counts = {}
+            for album in payload:
+                count = _as_count(album.get("assetCount")) if isinstance(album, dict) else None
+                if count is not None and isinstance(album.get("id"), str):
+                    counts[album["id"]] = count
+    except Exception as exc:
+        logger.info("picture_immich: album counts failed for %s: %s", library.get("id"), exc)
+    _count_store(cache_key, counts)
+    return counts
+
+
+def _source_count(library: dict[str, Any], kind: str, source_id: str) -> int:
+    """Photos in one album or under one tag, cached for an hour. Albums are
+    counted from the library's album list, one call for all of them; an album
+    the list doesn't hold (one shared with this user, say) is asked for on its
+    own. A tag tries ``search/statistics`` (needs the ``asset.statistics``
+    permission), then counts one page of up to ``TAG_COUNT_PAGE`` photos, so
+    without that permission a bigger tag weighs as that many. Returns 1 when
+    Immich can't say, so the source still gets a turn; that answer is kept
+    for a few minutes rather than asked for again on every render."""
+    cache_key = (str(library.get("id") or ""), kind, source_id)
+    known, value = _count_cached(cache_key)
+    if known:
+        return 1 if value is None else value
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    headers = _api_headers(key)
+    count: int | None = None
+    try:
+        if kind == "album":
+            listed = _album_counts(library)
+            count = listed.get(source_id) if listed is not None else None
+            if count is None:
+                album = fetch_json(
+                    f"{base}/api/albums/{urllib.parse.quote(source_id, safe='')}"
+                    "?withoutAssets=true",
+                    headers=headers,
+                    timeout=HTTP_TIMEOUT_S,
+                )
+                count = _as_count(album.get("assetCount")) if isinstance(album, dict) else None
+        else:
+            body = {"tagIds": [source_id], "type": "IMAGE"}
+            try:
+                stats = _post_json(
+                    f"{base}/api/search/statistics", headers, body, HTTP_TIMEOUT_S
+                )
+                count = _as_count(stats.get("total")) if isinstance(stats, dict) else None
+            except urllib.error.HTTPError:
+                count = None
+            if count is None:
+                page = _post_json(
+                    f"{base}/api/search/metadata",
+                    headers,
+                    {**body, "size": TAG_COUNT_PAGE},
+                    HTTP_TIMEOUT_S,
+                )
+                block = page.get("assets") if isinstance(page, dict) else None
+                items = block.get("items") if isinstance(block, dict) else None
+                if isinstance(items, list):
+                    count = max(len(items), _as_count(block.get("total")) or 0)
+    except Exception as exc:
+        logger.info("picture_immich: count failed for %s %s: %s", kind, source_id, exc)
+        count = None
+    _count_store(cache_key, count)
+    return 1 if count is None else count
+
+
+def _pick_asset_any(
+    library: dict[str, Any], album_ids: list[str], tag_ids: list[str]
+) -> dict[str, Any] | None:
+    """A photo from one of the chosen albums or tags. With more than one,
+    the source is picked weighted by its photo count, so each photo is
+    about equally likely; an empty source is skipped."""
+    sources = [("album", a) for a in album_ids] + [("tag", t) for t in tag_ids]
+    if len(sources) > 1:
+        weighted = [(s, _source_count(library, *s)) for s in sources]
+        remaining = [(s, w) for s, w in weighted if w > 0] or [(s, 1) for s in sources]
+    else:
+        remaining = [(s, 1) for s in sources]
+    for _ in range(min(_ANY_PICK_TRIES, len(remaining))):
+        index = random.choices(range(len(remaining)), weights=[w for _, w in remaining])[0]  # noqa: S311
+        (kind, source_id), _weight = remaining.pop(index)
+        if kind == "album":
+            asset = _pick_asset_album(library, source_id)
+        else:
+            asset = _pick_asset_tag(library, source_id)
+        if asset is not None:
+            return asset
+    return None
+
+
+def _pick_asset_every(
+    library: dict[str, Any], album_ids: list[str], tag_ids: list[str]
+) -> dict[str, Any] | None:
+    """A photo in every chosen album that carries every chosen tag, or None
+    when there is none. Raises ``SearchFailedError`` when Immich did not
+    answer, so a library that is down is not reported as an empty overlap.
+
+    Immich's search only returns photos owned by the API key's user, so in a
+    shared album other members' photos are not found here."""
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    if not (base and key):
+        raise SearchFailedError("library has no URL or API key")
+    payload = _fetch_random_assets(base, key, album_ids, tag_ids)
+    if payload is None:
+        raise SearchFailedError("search/random failed")
+    return _picked(payload)
+
+
+def _pick_asset_collection(
+    library: dict[str, Any], album_ids: list[str], tag_ids: list[str], match: str
+) -> dict[str, Any] | None:
+    if match == "all" and len(album_ids) + len(tag_ids) > 1:
+        return _pick_asset_every(library, album_ids, tag_ids)
+    return _pick_asset_any(library, album_ids, tag_ids)
 
 
 # ----- Lineups items --------------------------------------------------
@@ -845,22 +1064,48 @@ def _lineup_data_dir(ctx: dict[str, Any] | None) -> Path:
     return _data_dir()
 
 
-def _lineup_scope(options: dict[str, Any], library_id: str) -> tuple[str, dict[str, str]]:
-    """``(cache key, scope)`` for the photos these options draw from. The
-    scope names the source: ``album``, ``tag``, ``memory`` or ``random``."""
+def _lineup_scopes(options: dict[str, Any], library_id: str) -> list[tuple[str, dict[str, Any]]]:
+    """``(cache key, scope)`` for each source these options draw from. A
+    scope's source is ``album``, ``tag``, ``search`` (every chosen album and
+    tag at once), ``memory`` or ``random``. Albums and tags matched with
+    Any are one scope each, listed and cached on their own."""
     mode = (options.get("mode") or "memory").strip()
-    album_id = (options.get("album_id") or "").strip()
-    tag_id = (options.get("tag_id") or "").strip()
-    if mode == "random_album" and album_id:
-        scope = {"source": "album", "id": album_id}
-    elif mode == "random_tag" and tag_id:
-        scope = {"source": "tag", "id": tag_id}
+    scopes: list[dict[str, Any]] = []
+    if mode in COLLECTION_MODES:
+        album_ids, tag_ids, match = _selection(options)
+        if match == "all" and len(album_ids) + len(tag_ids) > 1:
+            albums, tags = sorted(album_ids), sorted(tag_ids)
+            scopes = [
+                {
+                    "source": "search",
+                    "id": ",".join([*(f"a:{a}" for a in albums), *(f"t:{t}" for t in tags)]),
+                    "filters": {"albumIds": albums, "tagIds": tags},
+                }
+            ]
+        else:
+            scopes = [{"source": "album", "id": a} for a in album_ids]
+            scopes += [{"source": "tag", "id": t} for t in tag_ids]
     elif mode == "memory":
-        scope = {"source": "memory", "id": datetime.now(tz=UTC).date().isoformat()}
-    else:
-        scope = {"source": "random", "id": ""}
-    raw = f"{library_id}|{scope['source']}|{scope['id']}"
-    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16], scope
+        scopes = [{"source": "memory", "id": datetime.now(tz=UTC).date().isoformat()}]
+    if not scopes:
+        scopes = [{"source": "random", "id": ""}]
+    out = []
+    for scope in scopes:
+        raw = f"{library_id}|{scope['source']}|{scope['id']}"
+        key = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+        out.append((key, scope))
+    return out
+
+
+def _scope_filters(scope: dict[str, Any]) -> dict[str, list[str]]:
+    """The search filters (``albumIds`` / ``tagIds``) a scope stands for."""
+    if scope["source"] == "search":
+        return {k: v for k, v in scope["filters"].items() if v}
+    if scope["source"] == "album":
+        return {"albumIds": [scope["id"]]}
+    if scope["source"] == "tag":
+        return {"tagIds": [scope["id"]]}
+    return {}
 
 
 def _lineup_cache_path(data_dir: Path, key: str) -> Path:
@@ -981,14 +1226,15 @@ def _call_timeout(deadline: float) -> float:
     return max(0.5, min(LINEUP_CALL_TIMEOUT_S, deadline - time.monotonic()))
 
 
-def _tag_items_step(
-    base: str, key: str, tag_id: str, entry: dict[str, Any], deadline: float
+def _search_items_step(
+    base: str, key: str, filters: dict[str, list[str]], entry: dict[str, Any], deadline: float
 ) -> dict[str, Any]:
-    """List images carrying a tag, a page of 250 at a time, until the deadline."""
+    """List images matching search filters (a tag, or albums and tags
+    together), a page of 250 at a time, until the deadline."""
     items: list[dict[str, str]] = entry["items"]
     page = int(entry.get("next_page") or 1)
     while page and len(items) < LINEUP_MAX_ITEMS and time.monotonic() < deadline:
-        body = {"tagIds": [tag_id], "type": "IMAGE", "size": 250, "page": page}
+        body = {**filters, "type": "IMAGE", "size": 250, "page": page}
         payload = _post_json(
             f"{base}/api/search/metadata",
             _api_headers(key),
@@ -1032,13 +1278,9 @@ def _memory_items(base: str, key: str, deadline: float) -> list[dict[str, str]]:
 
 
 def _random_items(
-    base: str, key: str, deadline: float, album_id: str | None = None, tag_id: str | None = None
+    base: str, key: str, deadline: float, filters: dict[str, list[str]] | None = None
 ) -> list[dict[str, str]]:
-    body: dict[str, Any] = {"size": LINEUP_RANDOM_POOL, "type": "IMAGE"}
-    if album_id:
-        body["albumIds"] = [album_id]
-    if tag_id:
-        body["tagIds"] = [tag_id]
+    body: dict[str, Any] = {"size": LINEUP_RANDOM_POOL, "type": "IMAGE", **(filters or {})}
     payload = _post_json(
         f"{base}/api/search/random", _api_headers(key), body, _call_timeout(deadline)
     )
@@ -1051,7 +1293,9 @@ def _lineup_listing(
 ) -> dict[str, Any] | None:
     """The cached (or time-boxed refreshed) listing for these options:
     ``{"items": [{id, label}], "total": int, "library": id, ...}``, or None
-    when the cell has no usable library."""
+    when the cell has no usable library. Several albums and tags matched
+    with Any are listed one by one and merged, a photo in two of them
+    listed once."""
     library_id = (options.get("library_id") or "").strip()
     if not library_id or not _LIBRARY_ID_RE.match(library_id):
         return None
@@ -1059,16 +1303,54 @@ def _lineup_listing(
     library = _by_id(data_dir, library_id)
     if library is None:
         return None
-    key_id, scope = _lineup_scope(options, library_id)
+    deadline = time.monotonic() + LINEUP_FETCH_BUDGET_S
+    parts = [
+        _scope_listing(data_dir, library, key_id, scope, deadline)
+        for key_id, scope in _lineup_scopes(options, library_id)
+    ]
+    found = [p for p in parts if p is not None]
+    if not found:
+        return None
+    if len(parts) == 1:
+        return {**found[0], "library": library_id}
+    seen: set[str] = set()
+    items: list[dict[str, str]] = []
+    for part in found:
+        for item in part["items"]:
+            if isinstance(item, dict) and item.get("id") and item["id"] not in seen:
+                seen.add(item["id"])
+                items.append(item)
+    unfinished = any(p.get("pending") or p.get("capped") for p in found)
+    total = (
+        max(len(items), sum(int(p.get("total") or len(p["items"])) for p in found))
+        if unfinished
+        else len(items)
+    )
+    return {
+        "items": items[:LINEUP_MAX_ITEMS],
+        "total": total,
+        "pending": ["more"] if any(p.get("pending") for p in found) else [],
+        "source": "union",
+        "library": library_id,
+    }
+
+
+def _scope_listing(
+    data_dir: Path, library: dict[str, Any], key_id: str, scope: dict[str, Any], deadline: float
+) -> dict[str, Any] | None:
+    """One source's listing, from its cache entry or refreshed until the
+    shared deadline. Past the deadline a source answers from its stale
+    entry, or as still pending, and fills in on a later request."""
     path = _lineup_cache_path(data_dir, key_id)
     entry = _lineup_read(path)
     if entry is not None and _lineup_entry_fresh(entry):
-        return {**entry, "library": library_id}
+        return entry
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
         return None
-    deadline = time.monotonic() + LINEUP_FETCH_BUDGET_S
+    if time.monotonic() >= deadline:
+        return entry or {"items": [], "total": 0, "pending": ["later"]}
     # A stale entry is resumed (an unfinished album) or kept as the answer
     # when Immich is slow or down; a complete stale one is read afresh.
     working: dict[str, Any] = (
@@ -1080,10 +1362,10 @@ def _lineup_listing(
     try:
         if scope["source"] == "album":
             working = _album_items_step(base, key, scope["id"], working, deadline)
-        elif scope["source"] == "tag":
+        elif scope["source"] in ("tag", "search"):
             if working.get("pending") is None:
                 working["pending"] = []
-            working = _tag_items_step(base, key, scope["id"], working, deadline)
+            working = _search_items_step(base, key, _scope_filters(scope), working, deadline)
         elif scope["source"] == "memory":
             working["items"] = _memory_items(base, key, deadline)
             working["pending"] = []
@@ -1099,7 +1381,7 @@ def _lineup_listing(
     except Exception as exc:
         logger.info("picture_immich: lineup listing failed (%s): %s", scope["source"], exc)
         if entry is not None:
-            return {**entry, "library": library_id}
+            return entry
         if not working["items"]:
             # No timeline / search API (an old server): list a random pool.
             try:
@@ -1107,20 +1389,19 @@ def _lineup_listing(
                     base,
                     key,
                     time.monotonic() + LINEUP_CALL_TIMEOUT_S,
-                    album_id=scope["id"] if scope["source"] == "album" else None,
-                    tag_id=scope["id"] if scope["source"] == "tag" else None,
+                    _scope_filters(scope),
                 )
             except Exception:
                 working["items"] = []
             working["pending"] = []
             working["total"] = len(working["items"])
             if not working["items"]:
-                return {"items": [], "total": 0, "pending": [], "library": library_id}
+                return {"items": [], "total": 0, "pending": []}
     if not working.get("total"):
         working["total"] = len(working["items"])
     working["ts"] = time.time()
     _lineup_write(path, working)
-    return {**working, "library": library_id}
+    return working
 
 
 def _library_total(base: str, key: str, deadline: float) -> int:
@@ -1202,6 +1483,18 @@ def _pinned_asset(library: dict[str, Any], asset_id: str) -> dict[str, Any] | No
 # ----- plugin contract ------------------------------------------------
 
 
+def _choice_label(
+    text: str, library: dict[str, Any], libraries: list[dict[str, Any]], suffix: str = ", {}"
+) -> str:
+    """A picker label, naming the library only when there is more than one
+    to tell apart."""
+    if len(libraries) < 2:
+        return text
+    sep = "" if suffix.startswith(",") else " "
+    return f"{text}{sep}{suffix.format(library.get('name') or library['id'])}"
+
+
+
 def choices(name: str) -> list[dict[str, Any]]:
     """Cell-editor populates dropdowns from this. ``name`` is the
     ``choices_from`` value declared in plugin.json."""
@@ -1219,34 +1512,36 @@ def choices(name: str) -> list[dict[str, Any]]:
     if name == "albums":
         # The cell-editor doesn't know which library is selected at
         # choices() time, so we collapse across every configured
-        # library. Each option is labelled "<album>, <library>" so
-        # they don't collide.
+        # library. With more than one, each option is labelled
+        # "<album>, <library>" so they don't collide.
         out: list[dict[str, Any]] = []
-        for lib in _load_libraries(data_dir):
-            for album in _list_albums(lib):
+        libraries = _load_libraries(data_dir)
+        for lib in libraries:
+            albums = sorted(_list_albums(lib), key=lambda a: str(a["name"]).casefold())
+            for album in albums:
                 out.append(
                     {
                         "value": album["id"],
-                        "label": f"{album['name']}, {lib.get('name') or lib['id']}",
+                        "label": _choice_label(album["name"], lib, libraries),
                     }
                 )
         if not out:
             return [{"value": "", "label": "No albums; check the library connection.", "note": True}]
         return out
     if name == "tags":
-        # Same cross-library collapse and "<tag>, <library>" labels as
-        # albums. A library whose key lacks ``tag.read`` contributes an
-        # empty-value hint row instead of silently contributing nothing.
+        # Same cross-library collapse and labels as albums. A library
+        # whose key lacks ``tag.read`` contributes an empty-value hint
+        # row instead of silently contributing nothing.
         tags_out: list[dict[str, Any]] = []
         hints: list[dict[str, Any]] = []
-        for lib in _load_libraries(data_dir):
-            lib_name = lib.get("name") or lib["id"]
+        libraries = _load_libraries(data_dir)
+        for lib in libraries:
             tags, hint = _list_tags(lib)
             if hint:
-                hints.append({"value": "", "label": f"{hint} ({lib_name})"})
+                hints.append({"value": "", "label": _choice_label(hint, lib, libraries, "({})")})
             for tag in tags:
                 tags_out.append(
-                    {"value": tag["id"], "label": f"{tag['name']}, {lib_name}"}
+                    {"value": tag["id"], "label": _choice_label(tag["name"], lib, libraries)}
                 )
         if not tags_out and not hints:
             return [
@@ -1283,13 +1578,24 @@ def fetch(
         pass  # pinned: nothing to pick
     elif mode == "random":
         asset = _pick_asset_random(library)
-    elif mode == "random_album":
-        asset = _pick_asset_album(library, (options.get("album_id") or "").strip())
-    elif mode == "random_tag":
-        tag_id = (options.get("tag_id") or "").strip()
-        if not tag_id:
-            return {"error": "Pick a tag in the cell editor."}
-        asset = _pick_asset_tag(library, tag_id)
+    elif mode in COLLECTION_MODES:
+        album_ids, tag_ids, match = _selection(options)
+        if not (album_ids or tag_ids):
+            return {"error": "Pick an album or a tag in the cell editor."}
+        try:
+            asset = _pick_asset_collection(library, album_ids, tag_ids, match)
+        except SearchFailedError:
+            return {
+                "error": "Immich did not answer the search for photos in every "
+                "chosen album and tag. Check the library connection."
+            }
+        if asset is None and match == "all" and len(album_ids) + len(tag_ids) > 1:
+            return {
+                "error": "No photo of yours is in every chosen album with every "
+                "chosen tag. Set Match to Any album or tag, or choose fewer. "
+                "Every only finds photos owned by the API key's user, so other "
+                "members' photos in a shared album don't count."
+            }
     else:
         # ``memory`` (default). Falls back to ``random`` when the
         # library has no memory for today, so the cell still paints

@@ -34,6 +34,7 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
         "mode",
         "album_id",
         "tag_id",
+        "match",
         "scale",
         "resolution",
         "show_caption",
@@ -44,9 +45,9 @@ def test_plugin_manifest_declares_expected_cell_options() -> None:
     assert library_opt["choices_from"] == "libraries"
     album_opt = next(o for o in manifest["cell_options"] if o["name"] == "album_id")
     assert album_opt["choices_from"] == "albums"
-    assert album_opt["show_if"] == {"mode": "random_album"}
-    tag_opt = next(o for o in manifest["cell_options"] if o["name"] == "tag_id")
-    assert tag_opt["show_if"] == {"mode": "random_tag"}
+    for name in ("album_id", "tag_id", "match"):
+        opt = next(o for o in manifest["cell_options"] if o["name"] == name)
+        assert opt["show_if"] == {"mode": "albums_tags"}
     caption_opt = next(o for o in manifest["cell_options"] if o["name"] == "caption_format")
     assert caption_opt["show_if"] == {"show_caption": True}
     # Every render picks its own photo, so the Lineups arrows draw another.
@@ -178,7 +179,12 @@ def test_album_uses_search_random_with_albumids(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key", "album-123")
     assert out == [{"id": "in_album", "originalMimeType": "image/jpeg"}]
     assert seen["url"].endswith("/api/search/random")
-    assert seen["body"] == {"size": 20, "withExif": True, "albumIds": ["album-123"]}
+    assert seen["body"] == {
+        "size": 20,
+        "withExif": True,
+        "albumIds": ["album-123"],
+        "type": "IMAGE",
+    }
 
 
 def test_album_falls_back_to_album_detail_assets(monkeypatch) -> None:
