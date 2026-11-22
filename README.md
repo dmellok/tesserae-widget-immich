@@ -32,6 +32,15 @@ Choose any number of albums and tags. **Match** decides how they combine:
   likely. An album includes other members' photos in a shared album.
 - **Every album and tag**: only photos that are in every chosen album and
   carry every chosen tag (`/api/search/random` with `albumIds` and `tagIds`).
+  Immich's search only returns photos owned by the API key's user, so in a
+  shared album other members' photos are not found by Every. Use Any, or a
+  key belonging to the photos' owner, to show them.
+
+With Any and more than one album or tag, the widget needs each one's photo
+count. Album counts come from one `/api/albums` call. A tag's count comes from
+`/api/search/statistics`, which needs the `asset.statistics` permission;
+without it the widget counts one page of 250 photos, so a bigger tag weighs as
+250. Counts are kept for an hour.
 
 The tag picker reads `/api/tags` and lists each tag by its full path
 (`Displays/Kitchen`), since Immich tags can be nested; a parent tag includes
@@ -41,7 +50,10 @@ Pickers name the library after each album or tag only when more than one
 library is connected.
 
 Cells saved with the old `random_album` or `random_tag` modes open as Albums
-and tags with their one album or tag.
+and tags with their one album or tag. This needs Tesserae 0.499.3 or later. On
+an older server those cells still show their photos, but the editor lists the
+old mode as unavailable and hides the album and tag pickers until you choose
+Albums and tags again.
 
 ### Orientation
 

@@ -74,7 +74,7 @@
           "label": "Every album and tag"
         }
       ],
-      "help": "Any: a photo from any chosen album or tag. Every: only photos that are in every chosen album and carry every chosen tag."
+      "help": "Any: a photo from any chosen album or tag. Every: only photos that are in every chosen album and carry every chosen tag. Every only finds photos owned by the API key's user, so other members' photos in a shared album are left out; Any includes them."
     },
     {
       "name": "orientation",

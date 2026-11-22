@@ -68,7 +68,12 @@ def test_tag_uses_search_random_with_tagids(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key", tag_id="tag-1")
     assert out == [{"id": "tagged", "originalMimeType": "image/jpeg"}]
     assert seen["url"].endswith("/api/search/random")
-    assert seen["body"] == {"size": 20, "withExif": True, "tagIds": ["tag-1"]}
+    assert seen["body"] == {
+        "size": 20,
+        "withExif": True,
+        "tagIds": ["tag-1"],
+        "type": "IMAGE",
+    }
 
 
 def test_tag_has_no_legacy_fallback(monkeypatch) -> None:
