@@ -179,7 +179,12 @@ def test_album_uses_search_random_with_albumids(monkeypatch) -> None:
     out = server._fetch_random_assets("http://immich", "key", "album-123")
     assert out == [{"id": "in_album", "originalMimeType": "image/jpeg"}]
     assert seen["url"].endswith("/api/search/random")
-    assert seen["body"] == {"size": 20, "withExif": True, "albumIds": ["album-123"]}
+    assert seen["body"] == {
+        "size": 20,
+        "withExif": True,
+        "albumIds": ["album-123"],
+        "type": "IMAGE",
+    }
 
 
 def test_album_falls_back_to_album_detail_assets(monkeypatch) -> None:

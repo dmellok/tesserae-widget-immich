@@ -578,7 +578,12 @@ def _fetch_random_assets(
     ``None``.
 
     Either may be a list. Immich returns only assets in every listed album
-    that carry every listed tag; the legacy fallback covers one album."""
+    that carry every listed tag; the legacy fallback covers one album. A
+    search narrowed to albums or tags asks for images only (``type``), as
+    the album timeline and the Lineups listings do.
+
+    ``None`` always means the request failed; an empty list means Immich
+    answered and nothing matched."""
     headers = _api_headers(key)
     # ``withExif`` matters: without it Immich omits ``exifInfo`` from
     # search results entirely, and the caption loses its reverse-geocoded
@@ -590,6 +595,8 @@ def _fetch_random_assets(
         body["albumIds"] = album_ids
     if tag_ids:
         body["tagIds"] = tag_ids
+    if album_ids or tag_ids:
+        body["type"] = "IMAGE"
     try:
         payload = _post_json(f"{base}/api/search/random", headers, body, HTTP_TIMEOUT_S)
         if isinstance(payload, list):
@@ -814,8 +821,18 @@ def _pick_asset_tag(library: dict[str, Any], tag_id: str) -> dict[str, Any] | No
 
 COLLECTION_MODES = ("albums_tags", "random_album", "random_tag")
 SOURCE_COUNT_TTL_S = 3600  # how long a source's photo count weights picks
+COUNT_FAILURE_TTL_S = 300  # how long a count Immich couldn't give is left alone
+TAG_COUNT_PAGE = 250  # photos read to count a tag when statistics are refused
 _ANY_PICK_TRIES = 3  # sources tried per render before giving up
-_source_counts: dict[tuple[str, str, str], tuple[float, int]] = {}
+# (library id, kind, source id) -> (good until, value). ``album`` and ``tag``
+# hold one source's count (None: Immich couldn't say); ``albums`` holds the
+# library's album list as {album id: assetCount} (None: the list failed).
+_source_counts: dict[tuple[str, str, str], tuple[float, Any]] = {}
+
+
+class SearchFailedError(RuntimeError):
+    """Immich did not answer a search (down, unreachable, refused), as
+    opposed to answering with nothing."""
 
 
 def _ids(value: Any) -> list[str]:
@@ -864,54 +881,107 @@ def _picked(pool: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
-def _source_count(library: dict[str, Any], kind: str, source_id: str) -> int:
-    """Photos in one album or under one tag, cached for an hour. An album
-    reads its ``assetCount``. A tag tries ``search/statistics`` (needs the
-    ``asset.statistics`` permission), then counts one page of up to 1000
-    photos. Returns 1 when Immich can't say, so the source still gets a
-    turn."""
-    cache_key = (str(library.get("id") or ""), kind, source_id)
+def _count_cached(cache_key: tuple[str, str, str]) -> tuple[bool, Any]:
     hit = _source_counts.get(cache_key)
-    if hit and time.time() - hit[0] < SOURCE_COUNT_TTL_S:
-        return hit[1]
+    if hit and time.time() < hit[0]:
+        return True, hit[1]
+    return False, None
+
+
+def _count_store(cache_key: tuple[str, str, str], value: Any) -> None:
+    """Keep a count for an hour, or a failure (None) for a few minutes so a
+    source Immich can't count is not asked about on every render."""
+    ttl = COUNT_FAILURE_TTL_S if value is None else SOURCE_COUNT_TTL_S
+    _source_counts[cache_key] = (time.time() + ttl, value)
+
+
+def _as_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _album_counts(library: dict[str, Any]) -> dict[str, int] | None:
+    """``{album id: assetCount}`` for the library from one ``GET /api/albums``
+    (the list the album picker shows), cached like a count. None when the
+    list can't be read."""
+    cache_key = (str(library.get("id") or ""), "albums", "")
+    known, value = _count_cached(cache_key)
+    if known:
+        return value
+    base = library.get("url", "").rstrip("/")
+    key = _unwrap_token(library.get("api_key_secret", ""))
+    counts: dict[str, int] | None = None
+    try:
+        payload = fetch_json(
+            f"{base}/api/albums", headers=_api_headers(key), timeout=HTTP_TIMEOUT_S
+        )
+        if isinstance(payload, list):
+            counts = {}
+            for album in payload:
+                count = _as_count(album.get("assetCount")) if isinstance(album, dict) else None
+                if count is not None and isinstance(album.get("id"), str):
+                    counts[album["id"]] = count
+    except Exception as exc:
+        logger.info("picture_immich: album counts failed for %s: %s", library.get("id"), exc)
+    _count_store(cache_key, counts)
+    return counts
+
+
+def _source_count(library: dict[str, Any], kind: str, source_id: str) -> int:
+    """Photos in one album or under one tag, cached for an hour. Albums are
+    counted from the library's album list, one call for all of them; an album
+    the list doesn't hold (one shared with this user, say) is asked for on its
+    own. A tag tries ``search/statistics`` (needs the ``asset.statistics``
+    permission), then counts one page of up to ``TAG_COUNT_PAGE`` photos, so
+    without that permission a bigger tag weighs as that many. Returns 1 when
+    Immich can't say, so the source still gets a turn; that answer is kept
+    for a few minutes rather than asked for again on every render."""
+    cache_key = (str(library.get("id") or ""), kind, source_id)
+    known, value = _count_cached(cache_key)
+    if known:
+        return 1 if value is None else value
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     headers = _api_headers(key)
-    count: Any = None
+    count: int | None = None
     try:
         if kind == "album":
-            album = fetch_json(
-                f"{base}/api/albums/{urllib.parse.quote(source_id, safe='')}?withoutAssets=true",
-                headers=headers,
-                timeout=HTTP_TIMEOUT_S,
-            )
-            count = album.get("assetCount") if isinstance(album, dict) else None
+            listed = _album_counts(library)
+            count = listed.get(source_id) if listed is not None else None
+            if count is None:
+                album = fetch_json(
+                    f"{base}/api/albums/{urllib.parse.quote(source_id, safe='')}"
+                    "?withoutAssets=true",
+                    headers=headers,
+                    timeout=HTTP_TIMEOUT_S,
+                )
+                count = _as_count(album.get("assetCount")) if isinstance(album, dict) else None
         else:
             body = {"tagIds": [source_id], "type": "IMAGE"}
             try:
                 stats = _post_json(
                     f"{base}/api/search/statistics", headers, body, HTTP_TIMEOUT_S
                 )
-                count = stats.get("total") if isinstance(stats, dict) else None
+                count = _as_count(stats.get("total")) if isinstance(stats, dict) else None
             except urllib.error.HTTPError:
                 count = None
-            if not isinstance(count, int):
+            if count is None:
                 page = _post_json(
                     f"{base}/api/search/metadata",
                     headers,
-                    {**body, "size": 1000},
+                    {**body, "size": TAG_COUNT_PAGE},
                     HTTP_TIMEOUT_S,
                 )
                 block = page.get("assets") if isinstance(page, dict) else None
                 items = block.get("items") if isinstance(block, dict) else None
-                count = len(items) if isinstance(items, list) else None
+                if isinstance(items, list):
+                    count = max(len(items), _as_count(block.get("total")) or 0)
     except Exception as exc:
         logger.info("picture_immich: count failed for %s %s: %s", kind, source_id, exc)
-        return 1
-    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-        return 1
-    _source_counts[cache_key] = (time.time(), count)
-    return count
+        count = None
+    _count_store(cache_key, count)
+    return 1 if count is None else count
 
 
 def _pick_asset_any(
@@ -941,12 +1011,20 @@ def _pick_asset_any(
 def _pick_asset_every(
     library: dict[str, Any], album_ids: list[str], tag_ids: list[str]
 ) -> dict[str, Any] | None:
-    """A photo in every chosen album that carries every chosen tag."""
+    """A photo in every chosen album that carries every chosen tag, or None
+    when there is none. Raises ``SearchFailedError`` when Immich did not
+    answer, so a library that is down is not reported as an empty overlap.
+
+    Immich's search only returns photos owned by the API key's user, so in a
+    shared album other members' photos are not found here."""
     base = library.get("url", "").rstrip("/")
     key = _unwrap_token(library.get("api_key_secret", ""))
     if not (base and key):
-        return None
-    return _picked(_fetch_random_assets(base, key, album_ids, tag_ids) or [])
+        raise SearchFailedError("library has no URL or API key")
+    payload = _fetch_random_assets(base, key, album_ids, tag_ids)
+    if payload is None:
+        raise SearchFailedError("search/random failed")
+    return _picked(payload)
 
 
 def _pick_asset_collection(
@@ -1504,11 +1582,19 @@ def fetch(
         album_ids, tag_ids, match = _selection(options)
         if not (album_ids or tag_ids):
             return {"error": "Pick an album or a tag in the cell editor."}
-        asset = _pick_asset_collection(library, album_ids, tag_ids, match)
+        try:
+            asset = _pick_asset_collection(library, album_ids, tag_ids, match)
+        except SearchFailedError:
+            return {
+                "error": "Immich did not answer the search for photos in every "
+                "chosen album and tag. Check the library connection."
+            }
         if asset is None and match == "all" and len(album_ids) + len(tag_ids) > 1:
             return {
-                "error": "No photo is in every chosen album with every chosen tag. "
-                "Set Match to Any album or tag, or choose fewer."
+                "error": "No photo of yours is in every chosen album with every "
+                "chosen tag. Set Match to Any album or tag, or choose fewer. "
+                "Every only finds photos owned by the API key's user, so other "
+                "members' photos in a shared album don't count."
             }
     else:
         # ``memory`` (default). Falls back to ``random`` when the

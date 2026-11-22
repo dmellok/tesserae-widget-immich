@@ -144,6 +144,38 @@ def test_every_with_no_overlap_says_so(server, monkeypatch) -> None:
     monkeypatch.setattr(server, "_post_json", lambda *a: [])
     out = server.fetch(_opts(album_id=["a"], tag_id=["t"], match="all"), {}, ctx={})
     assert "every chosen album" in out["error"]
+    assert "Set Match to Any" in out["error"]
+    assert "owned by the API key's user" in out["error"]
+
+
+def test_every_tells_a_failed_search_from_an_empty_one(server, monkeypatch) -> None:
+    def down(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(server, "_post_json", down)
+    monkeypatch.setattr(server, "fetch_json", down)
+    out = server.fetch(_opts(album_id=["a"], tag_id=["t"], match="all"), {}, ctx={})
+    assert "did not answer" in out["error"]
+    assert "Check the library connection" in out["error"]
+    assert "Set Match" not in out["error"]
+    # An answer that is not a list of assets is a failure too, not an empty overlap.
+    monkeypatch.setattr(server, "_post_json", lambda *a: {"message": "Bad Request"})
+    out = server.fetch(_opts(album_id=["a", "b"], match="all"), {}, ctx={})
+    assert "did not answer" in out["error"]
+
+
+def test_narrowed_searches_ask_for_images_only(server, monkeypatch) -> None:
+    bodies = []
+
+    def fake_post(url, headers, body, timeout):
+        bodies.append(body)
+        return [{"id": "x1", "originalMimeType": "image/jpeg"}]
+
+    monkeypatch.setattr(server, "_post_json", fake_post)
+    server.fetch(_opts(album_id=["a"], tag_id=["t"], match="all"), {}, ctx={})
+    server._fetch_random_assets("http://immich", "key", tag_id="t")
+    server._fetch_random_assets("http://immich", "key")
+    assert [b.get("type") for b in bodies] == ["IMAGE", "IMAGE", None]
 
 
 def _forbidden():
@@ -159,8 +191,10 @@ def test_tag_count_falls_back_to_one_page_and_is_cached(server, monkeypatch) -> 
         calls.append(url)
         if url.endswith("/statistics"):
             raise _forbidden()
+        sizes.append(body.get("size"))
         return {"assets": {"items": [{"id": "1"}, {"id": "2"}], "total": 2}}
 
+    sizes = []
     monkeypatch.setattr(server, "_post_json", fake_post)
     assert server._source_count(LIB, "tag", "t") == 2
     assert server._source_count(LIB, "tag", "t") == 2
@@ -168,19 +202,67 @@ def test_tag_count_falls_back_to_one_page_and_is_cached(server, monkeypatch) -> 
         "http://immich/api/search/statistics",
         "http://immich/api/search/metadata",
     ]
+    # One page, far short of a thousand full records.
+    assert sizes == [server.TAG_COUNT_PAGE] and server.TAG_COUNT_PAGE <= 250
 
 
-def test_album_count_reads_asset_count(server, monkeypatch) -> None:
-    monkeypatch.setattr(server, "fetch_json", lambda url, **k: {"assetCount": 40})
-    assert server._source_count(LIB, "album", "a") == 40
+def test_album_counts_come_from_one_album_list_call(server, monkeypatch) -> None:
+    urls = []
+
+    def fake_get(url, **k):
+        urls.append(url)
+        return [
+            {"id": "a", "assetCount": 40},
+            {"id": "b", "assetCount": 0},
+            {"id": "c", "assetCount": 7},
+        ]
+
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    assert [server._source_count(LIB, "album", x) for x in "abc"] == [40, 0, 7]
+    assert [server._source_count(LIB, "album", x) for x in "abc"] == [40, 0, 7]
+    assert urls == ["http://immich/api/albums"]
+
+
+def test_an_album_the_list_lacks_is_asked_for_on_its_own(server, monkeypatch) -> None:
+    urls = []
+
+    def fake_get(url, **k):
+        urls.append(url)
+        if url.endswith("/api/albums"):
+            return [{"id": "a", "assetCount": 40}]
+        return {"id": "shared", "assetCount": 12}
+
+    monkeypatch.setattr(server, "fetch_json", fake_get)
+    assert server._source_count(LIB, "album", "shared") == 12
+    assert server._source_count(LIB, "album", "shared") == 12
+    assert urls == [
+        "http://immich/api/albums",
+        "http://immich/api/albums/shared?withoutAssets=true",
+    ]
 
 
 def test_count_failure_still_gives_the_source_a_turn(server, monkeypatch) -> None:
+    calls = []
+
     def down(*a, **k):
+        calls.append(a)
         raise OSError("down")
 
     monkeypatch.setattr(server, "fetch_json", down)
+    monkeypatch.setattr(server, "_post_json", down)
     assert server._source_count(LIB, "album", "a") == 1
+    assert server._source_count(LIB, "tag", "t") == 1
+    asked = len(calls)
+    # The failure is kept for a few minutes: nothing more is asked.
+    assert server._source_count(LIB, "album", "a") == 1
+    assert server._source_count(LIB, "album", "other") == 1
+    assert server._source_count(LIB, "tag", "t") == 1
+    assert len(calls) == asked + 1  # only the album not yet asked about
+    # Once the wait is over Immich is asked again.
+    now = server.time.time()
+    monkeypatch.setattr(server.time, "time", lambda: now + server.COUNT_FAILURE_TTL_S + 1)
+    assert server._source_count(LIB, "tag", "t") == 1
+    assert len(calls) > asked + 1
 
 
 @pytest.mark.parametrize(
